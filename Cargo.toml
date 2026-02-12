@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sykla-core",
+    "crates/sykla-server",
+    "crates/sykla-web",
+    "crates/sykla-world",
+    "crates/sykla-mobile-core",
+    "crates/sykla-city-gen",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"

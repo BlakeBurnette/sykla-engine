@@ -1,0 +1,12 @@
+[package]
+name = "sykla-world"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sykla-core = { path = "../sykla-core" }
+serde = { workspace = true }
+bincode = "1"
+
+[dev-dependencies]
+bincode = "1"

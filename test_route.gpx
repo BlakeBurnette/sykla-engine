@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Sykla" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Cary Greenway Loop</name>
+    <trkseg>
+      <trkpt lat="35.7796" lon="-78.7981"><ele>105</ele></trkpt>
+      <trkpt lat="35.7800" lon="-78.7970"><ele>107</ele></trkpt>
+      <trkpt lat="35.7810" lon="-78.7955"><ele>112</ele></trkpt>
+      <trkpt lat="35.7825" lon="-78.7940"><ele>118</ele></trkpt>
+      <trkpt lat="35.7840" lon="-78.7920"><ele>125</ele></trkpt>
+      <trkpt lat="35.7855" lon="-78.7900"><ele>130</ele></trkpt>
+      <trkpt lat="35.7870" lon="-78.7885"><ele>128</ele></trkpt>
+      <trkpt lat="35.7885" lon="-78.7870"><ele>122</ele></trkpt>
+      <trkpt lat="35.7895" lon="-78.7855"><ele>118</ele></trkpt>
+      <trkpt lat="35.7900" lon="-78.7840"><ele>115</ele></trkpt>
+      <trkpt lat="35.7905" lon="-78.7820"><ele>120</ele></trkpt>
+      <trkpt lat="35.7910" lon="-78.7800"><ele>128</ele></trkpt>
+      <trkpt lat="35.7920" lon="-78.7785"><ele>135</ele></trkpt>
+      <trkpt lat="35.7935" lon="-78.7770"><ele>140</ele></trkpt>
+      <trkpt lat="35.7950" lon="-78.7760"><ele>138</ele></trkpt>
+      <trkpt lat="35.7960" lon="-78.7750"><ele>132</ele></trkpt>
+      <trkpt lat="35.7970" lon="-78.7740"><ele>125</ele></trkpt>
+      <trkpt lat="35.7975" lon="-78.7725"><ele>118</ele></trkpt>
+      <trkpt lat="35.7970" lon="-78.7710"><ele>112</ele></trkpt>
+      <trkpt lat="35.7960" lon="-78.7700"><ele>108</ele></trkpt>
+      <trkpt lat="35.7945" lon="-78.7695"><ele>105</ele></trkpt>
+      <trkpt lat="35.7930" lon="-78.7700"><ele>103</ele></trkpt>
+      <trkpt lat="35.7915" lon="-78.7710"><ele>100</ele></trkpt>
+      <trkpt lat="35.7900" lon="-78.7725"><ele>98</ele></trkpt>
+      <trkpt lat="35.7885" lon="-78.7740"><ele>96</ele></trkpt>
+      <trkpt lat="35.7870" lon="-78.7760"><ele>98</ele></trkpt>
+      <trkpt lat="35.7855" lon="-78.7780"><ele>100</ele></trkpt>
+      <trkpt lat="35.7840" lon="-78.7800"><ele>102</ele></trkpt>
+      <trkpt lat="35.7825" lon="-78.7820"><ele>103</ele></trkpt>
+      <trkpt lat="35.7810" lon="-78.7840"><ele>104</ele></trkpt>
+      <trkpt lat="35.7800" lon="-78.7860"><ele>105</ele></trkpt>
+      <trkpt lat="35.7795" lon="-78.7880"><ele>106</ele></trkpt>
+      <trkpt lat="35.7793" lon="-78.7900"><ele>107</ele></trkpt>
+      <trkpt lat="35.7792" lon="-78.7920"><ele>106</ele></trkpt>
+      <trkpt lat="35.7793" lon="-78.7940"><ele>105</ele></trkpt>
+      <trkpt lat="35.7795" lon="-78.7960"><ele>105</ele></trkpt>
+      <trkpt lat="35.7796" lon="-78.7981"><ele>105</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

@@ -1,0 +1,44 @@
+[package]
+name = "sykla-web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sykla-core = { path = "../sykla-core" }
+sykla-world = { path = "../sykla-world" }
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_scene",
+    "bevy_sprite",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "bevy_state",
+    "default_font",
+    "webgl2",
+    "png",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Window",
+    "Document",
+    "HtmlElement",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Headers",
+] }
+js-sys = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+bincode = "1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

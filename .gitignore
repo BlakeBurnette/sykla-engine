@@ -1,0 +1,34 @@
+/target
+**/target
+*.swp
+*.swo
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+.credentials
+
+# WASM build output
+web/dist/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# iOS
+apps/ios/build/
+apps/ios/DerivedData/
+*.xcuserdata
+
+# Android
+apps/android/.gradle/
+apps/android/build/
+apps/android/app/build/
+*.apk
+*.aab
+
+# Garmin
+apps/garmin/bin/
