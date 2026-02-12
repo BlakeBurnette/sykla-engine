@@ -14,6 +14,7 @@ COPY crates/sykla-server/Cargo.toml crates/sykla-server/Cargo.toml
 COPY crates/sykla-world/Cargo.toml crates/sykla-world/Cargo.toml
 COPY crates/sykla-web/Cargo.toml crates/sykla-web/Cargo.toml
 COPY crates/sykla-mobile-core/Cargo.toml crates/sykla-mobile-core/Cargo.toml
+COPY crates/sykla-city-gen/Cargo.toml crates/sykla-city-gen/Cargo.toml
 
 # Create dummy source files for dependency caching
 RUN mkdir -p crates/sykla-core/src && echo "// dummy" > crates/sykla-core/src/lib.rs && \
@@ -21,6 +22,7 @@ RUN mkdir -p crates/sykla-core/src && echo "// dummy" > crates/sykla-core/src/li
     mkdir -p crates/sykla-world/src && echo "// dummy" > crates/sykla-world/src/lib.rs && \
     mkdir -p crates/sykla-web/src && echo "// dummy" > crates/sykla-web/src/lib.rs && \
     mkdir -p crates/sykla-mobile-core/src && echo "// dummy" > crates/sykla-mobile-core/src/lib.rs && \
+    mkdir -p crates/sykla-city-gen/src && echo "fn main() {}" > crates/sykla-city-gen/src/main.rs && \
     mkdir -p migrations && touch migrations/.keep
 
 # Build dependencies only (cached layer)

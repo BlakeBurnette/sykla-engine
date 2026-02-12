@@ -10,6 +10,11 @@
 credentials.json
 .credentials
 
+# City data (stored in GCS)
+*.sykla
+assets/cities/
+assets/routes/
+
 # WASM build output
 web/dist/
 

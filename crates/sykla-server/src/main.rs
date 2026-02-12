@@ -11,14 +11,19 @@ use tower_http::cors::{Any, CorsLayer};
 
 use auth::{auth_middleware, auth_router};
 use config::Config;
-use routes::{rides::rides_router, routes_api::routes_router, users::users_router};
-use ws::{new_room_manager, ws_handler, RoomManager};
+use routes::{
+    activities::activities_router, cities::cities_router, heatmap::heatmap_router,
+    rides::rides_router, routes_api::routes_router, users::users_router,
+};
+use ws::{new_global_room, new_room_manager, global_ws_handler, ws_handler, GlobalRoomHandle, RoomManager};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub jwt_secret: String,
     pub rooms: RoomManager,
+    pub global_room: GlobalRoomHandle,
+    pub gcs_bucket: String,
 }
 
 #[tokio::main]
@@ -46,6 +51,8 @@ async fn main() {
         db,
         jwt_secret: config.jwt_secret.clone(),
         rooms: new_room_manager(),
+        global_room: new_global_room(),
+        gcs_bucket: config.gcs_bucket.clone(),
     };
 
     let cors = CorsLayer::new()
@@ -56,12 +63,16 @@ async fn main() {
     // Public routes (no auth)
     let public_routes = Router::new()
         .nest("/api/auth", auth_router())
-        .route("/api/sync/{route_id}", get(ws_handler));
+        .nest("/api/cities", cities_router())
+        .nest("/api/heatmap", heatmap_router())
+        .route("/api/sync/{route_id}", get(ws_handler))
+        .route("/api/sync/global", get(global_ws_handler));
 
     // Protected routes (require JWT)
     let protected_routes = Router::new()
         .nest("/api/routes", routes_router())
         .nest("/api/rides", rides_router())
+        .nest("/api/activities", activities_router())
         .nest("/api/users", users_router())
         .layer(middleware::from_fn(auth_middleware));
 

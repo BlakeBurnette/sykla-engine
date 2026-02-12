@@ -33,17 +33,15 @@ impl Plugin for CityLoaderPlugin {
     }
 }
 
-/// On startup, kick off an async fetch of the city data file.
+/// On startup, kick off an async fetch of the city data via the server API.
 fn trigger_city_load(mut state: ResMut<CityLoadState>) {
     if state.loading || state.loaded {
         return;
     }
     state.loading = true;
 
-    // For local dev: place the .sykla file in the web/ directory as "city.sykla".
-    // For production: serve from CDN.
     wasm_bindgen_futures::spawn_local(async {
-        let result = fetch_bytes("city.sykla").await;
+        let result = fetch_city_from_api().await;
         LOADED_CITY.with(|cell| {
             *cell.borrow_mut() = Some(result);
         });
@@ -116,6 +114,80 @@ fn check_city_loaded(
             state.loading = false;
         }
     }
+}
+
+/// Read the `?city=` query parameter, defaulting to "cary-nc".
+fn get_city_slug() -> String {
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => return "cary-nc".to_string(),
+    };
+    let search = match window.location().search() {
+        Ok(s) => s,
+        Err(_) => return "cary-nc".to_string(),
+    };
+    let params = match web_sys::UrlSearchParams::new_with_str(&search) {
+        Ok(p) => p,
+        Err(_) => return "cary-nc".to_string(),
+    };
+    params.get("city").unwrap_or_else(|| "cary-nc".to_string())
+}
+
+/// Get the API base URL from the current origin.
+fn get_api_base_url() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_else(|| "http://localhost:3030".to_string())
+}
+
+/// Fetch city metadata from server API, then download the binary data from GCS.
+async fn fetch_city_from_api() -> Result<Vec<u8>, String> {
+    let slug = get_city_slug();
+    let base = get_api_base_url();
+    let api_url = format!("{base}/api/cities/{slug}");
+
+    web_sys::console::log_1(&format!("Fetching city metadata: {api_url}").into());
+
+    // Fetch city metadata from server
+    let json = fetch_json(&api_url).await?;
+
+    let download_url = js_sys::Reflect::get(&json, &"download_url".into())
+        .map_err(|_| "Missing download_url in response".to_string())?
+        .as_string()
+        .ok_or("download_url is not a string")?;
+
+    web_sys::console::log_1(&format!("Downloading city data: {download_url}").into());
+
+    // Fetch binary city data from GCS
+    fetch_bytes(&download_url).await
+}
+
+/// Fetch a URL and parse the response as JSON.
+async fn fetch_json(url: &str) -> Result<JsValue, String> {
+    let mut opts = RequestInit::new();
+    opts.set_method("GET");
+
+    let request =
+        Request::new_with_str_and_init(url, &opts).map_err(|e| format!("Request error: {e:?}"))?;
+
+    let window = web_sys::window().ok_or("No window")?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("Fetch error: {e:?}"))?;
+
+    let resp: Response = resp_value
+        .dyn_into()
+        .map_err(|_| "Response cast failed".to_string())?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {} fetching {url}", resp.status()));
+    }
+
+    let json = JsFuture::from(resp.json().map_err(|e| format!("JSON error: {e:?}"))?)
+        .await
+        .map_err(|e| format!("JSON parse error: {e:?}"))?;
+
+    Ok(json)
 }
 
 /// Fetch raw bytes from a URL using the browser Fetch API.

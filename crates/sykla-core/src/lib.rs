@@ -6,3 +6,7 @@ pub mod route;
 pub mod ftms;
 pub mod ride_engine;
 pub mod projection;
+pub mod activity;
+pub mod gpx_activity_parser;
+pub mod heatmap;
+pub mod corridor_detector;

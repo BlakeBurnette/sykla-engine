@@ -9,6 +9,7 @@ mod parking;
 mod format;
 mod corridor;
 mod graph;
+mod upload;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -44,6 +45,18 @@ struct Cli {
     /// Output file path
     #[arg(long, default_value = "city.sykla")]
     output: PathBuf,
+
+    /// Upload to GCS and register in database after generating
+    #[arg(long, default_value_t = false)]
+    upload: bool,
+
+    /// GCS bucket name
+    #[arg(long, env = "GCS_BUCKET", default_value = "sykla-city-data")]
+    bucket: String,
+
+    /// Database URL for city registration
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 fn parse_bbox(s: &str) -> Result<(f64, f64, f64, f64), String> {
@@ -309,5 +322,57 @@ fn main() {
             cli.output.display(),
             file_size as f64 / 1_024.0
         );
+    }
+
+    // Upload to GCS and register in DB if requested
+    if cli.upload {
+        let db_url = cli.database_url.as_deref().unwrap_or_else(|| {
+            eprintln!("Error: --database-url or DATABASE_URL is required when --upload is set");
+            std::process::exit(1);
+        });
+
+        let file_data = std::fs::read(&cli.output).unwrap_or_else(|e| {
+            eprintln!("Error reading output file for upload: {e}");
+            std::process::exit(1);
+        });
+
+        // Determine version by querying existing record
+        let object_path = format!("cities/{}/v1.sykla", cli.name);
+        let download_url = format!(
+            "https://storage.googleapis.com/{}/{}",
+            cli.bucket, object_path
+        );
+
+        println!("Uploading to GCS...");
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            upload::upload_to_gcs(&cli.bucket, &object_path, file_data)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("GCS upload failed: {e}");
+                    std::process::exit(1);
+                });
+
+            println!("Registering city in database...");
+            upload::register_city(
+                db_url,
+                &cli.name,
+                &cli.name,
+                center_lat,
+                center_lng,
+                (south, west, north, east),
+                file_size as i64,
+                &cli.bucket,
+                &object_path,
+                &download_url,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Database registration failed: {e}");
+                std::process::exit(1);
+            });
+        });
+
+        println!("Upload complete: {download_url}");
     }
 }

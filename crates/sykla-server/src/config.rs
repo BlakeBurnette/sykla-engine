@@ -5,6 +5,7 @@ pub struct Config {
     pub jwt_secret: String,
     pub host: String,
     pub port: u16,
+    pub gcs_bucket: String,
 }
 
 impl Config {
@@ -19,6 +20,8 @@ impl Config {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3030),
+            gcs_bucket: std::env::var("GCS_BUCKET")
+                .unwrap_or_else(|_| "sykla-city-data".to_string()),
         }
     }
 

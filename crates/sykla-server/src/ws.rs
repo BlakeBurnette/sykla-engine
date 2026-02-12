@@ -14,6 +14,63 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+// ---------------------------------------------------------------------------
+// Global sync types (cross-world visibility)
+// ---------------------------------------------------------------------------
+
+/// A geographic position update from an outdoor rider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum GlobalClientMessage {
+    #[serde(rename = "geo_position")]
+    GeoPosition {
+        lat: f64,
+        lng: f64,
+        speed_kmh: f64,
+        heading: f64,
+        display_name: Option<String>,
+        is_indoor: bool,
+    },
+}
+
+/// Server broadcast of nearby riders in the global channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum GlobalServerMessage {
+    #[serde(rename = "nearby_riders")]
+    NearbyRiders { riders: Vec<GlobalRiderPosition> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalRiderPosition {
+    pub user_id: String,
+    pub display_name: String,
+    pub lat: f64,
+    pub lng: f64,
+    pub speed_kmh: f64,
+    pub heading: f64,
+    pub is_indoor: bool,
+}
+
+/// Global room for cross-world visibility.
+pub struct GlobalRoom {
+    pub tx: broadcast::Sender<String>,
+    pub riders: DashMap<Uuid, GlobalRiderPosition>,
+}
+
+impl GlobalRoom {
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(256);
+        Self {
+            tx,
+            riders: DashMap::new(),
+        }
+    }
+}
+
+/// Shared global room instance.
+pub type GlobalRoomHandle = Arc<GlobalRoom>;
+
 /// A position update from a client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -153,4 +210,104 @@ async fn handle_socket(socket: WebSocket, route_id: Uuid, state: AppState) {
     if room.riders.is_empty() {
         state.rooms.remove(&route_id);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Global sync WebSocket handler (cross-world visibility)
+// ---------------------------------------------------------------------------
+
+pub fn new_global_room() -> GlobalRoomHandle {
+    Arc::new(GlobalRoom::new())
+}
+
+/// WebSocket upgrade handler for global sync.
+pub async fn global_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_global_socket(socket, state))
+}
+
+/// Default proximity radius for nearby rider broadcasting (meters).
+const PROXIMITY_RADIUS_M: f64 = 5000.0;
+
+async fn handle_global_socket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    let room = &state.global_room;
+    let user_id = Uuid::new_v4();
+    let display_name = format!("Rider-{}", &user_id.to_string()[..4]);
+
+    let mut rx = room.tx.subscribe();
+
+    // Forward broadcasts to this client
+    let user_id_clone = user_id;
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Handle incoming messages
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(text) => {
+                if let Ok(client_msg) = serde_json::from_str::<GlobalClientMessage>(&text) {
+                    match client_msg {
+                        GlobalClientMessage::GeoPosition {
+                            lat,
+                            lng,
+                            speed_kmh,
+                            heading,
+                            display_name: name_override,
+                            is_indoor,
+                        } => {
+                            let rider_name =
+                                name_override.unwrap_or_else(|| display_name.clone());
+
+                            room.riders.insert(
+                                user_id,
+                                GlobalRiderPosition {
+                                    user_id: user_id.to_string(),
+                                    display_name: rider_name,
+                                    lat,
+                                    lng,
+                                    speed_kmh,
+                                    heading,
+                                    is_indoor,
+                                },
+                            );
+
+                            // Broadcast nearby riders to all (filtered by proximity)
+                            let my_pos = (lat, lng);
+                            let nearby: Vec<GlobalRiderPosition> = room
+                                .riders
+                                .iter()
+                                .filter(|r| {
+                                    let d = sykla_core::geo_math::haversine_distance(
+                                        my_pos.0, my_pos.1, r.lat, r.lng,
+                                    );
+                                    d <= PROXIMITY_RADIUS_M
+                                })
+                                .map(|r| r.value().clone())
+                                .collect();
+
+                            let server_msg = GlobalServerMessage::NearbyRiders { riders: nearby };
+                            if let Ok(json) = serde_json::to_string(&server_msg) {
+                                let _ = room.tx.send(json);
+                            }
+                        }
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Clean up
+    room.riders.remove(&user_id_clone);
+    send_task.abort();
 }

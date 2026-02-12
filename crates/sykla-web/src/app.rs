@@ -5,6 +5,7 @@ use crate::ble::TrainerPlugin;
 use crate::city_loader::CityLoaderPlugin;
 use crate::free_roam::FreeRoamPlugin;
 use crate::hud::HudPlugin;
+use crate::outdoor_riders::OutdoorRidersPlugin;
 use crate::ride::RidePlugin;
 use crate::sync_client::SyncPlugin;
 use crate::world_render::WorldRenderPlugin;
@@ -46,6 +47,7 @@ impl SyklaApp {
                 SyncPlugin,
                 CityLoaderPlugin,
                 FreeRoamPlugin,
+                OutdoorRidersPlugin,
             ))
             .add_systems(Startup, setup_camera)
             .run();
