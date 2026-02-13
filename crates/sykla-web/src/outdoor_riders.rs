@@ -59,13 +59,10 @@ fn update_outdoor_riders(
         let (x, z) = proj.projection.project(rider.lat, rider.lng);
 
         if let Some(&entity) = existing_ids.get(&rider.user_id) {
-            // Update existing avatar position
-            if let Ok(mut transform) = commands.get_entity(entity).map(|_| ()) {
-                // We can't directly query mut Transform here, so we'll just
-                // keep the avatar. Full transform update requires a separate query.
-                let _ = transform;
-            }
+            // Avatar already exists — position will be updated by the
+            // update_outdoor_rider_positions system. Just mark as still active.
             existing_ids.remove(&rider.user_id);
+            let _ = entity;
         } else {
             // Spawn new outdoor rider avatar (green sphere to distinguish from indoor orange)
             commands.spawn((

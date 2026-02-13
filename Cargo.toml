@@ -7,6 +7,8 @@ members = [
     "crates/sykla-world",
     "crates/sykla-mobile-core",
     "crates/sykla-city-gen",
+    "crates/sykla-godot",
+    "crates/sykla-engine",
 ]
 
 [workspace.dependencies]

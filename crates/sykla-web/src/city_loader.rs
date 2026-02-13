@@ -86,6 +86,7 @@ fn check_city_loaded(
                         elevation_m: 100.0,
                         distance_from_start_m: 0.0,
                         grade_percent: Some(0.0),
+                        surface: Default::default(),
                     }],
                     total_distance_m: 0.0,
                     elevation_gain_m: 0.0,

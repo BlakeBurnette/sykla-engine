@@ -1,5 +1,49 @@
 use serde::{Deserialize, Serialize};
 
+/// Road surface type — affects rolling resistance in the ride engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SurfaceType {
+    #[default]
+    Asphalt,
+    Concrete,
+    Gravel,
+    Cobblestone,
+    Dirt,
+    Sand,
+    Grass,
+    Wet,
+}
+
+impl SurfaceType {
+    /// Stable integer representation for FFI (C ABI).
+    pub fn as_i32(&self) -> i32 {
+        match self {
+            SurfaceType::Asphalt => 0,
+            SurfaceType::Concrete => 1,
+            SurfaceType::Gravel => 2,
+            SurfaceType::Cobblestone => 3,
+            SurfaceType::Dirt => 4,
+            SurfaceType::Sand => 5,
+            SurfaceType::Grass => 6,
+            SurfaceType::Wet => 7,
+        }
+    }
+
+    /// Rolling resistance coefficient relative to asphalt (1.0).
+    pub fn rolling_resistance(&self) -> f64 {
+        match self {
+            SurfaceType::Asphalt => 1.0,
+            SurfaceType::Concrete => 1.05,
+            SurfaceType::Gravel => 1.6,
+            SurfaceType::Cobblestone => 1.4,
+            SurfaceType::Dirt => 1.5,
+            SurfaceType::Sand => 2.5,
+            SurfaceType::Grass => 1.8,
+            SurfaceType::Wet => 1.15,
+        }
+    }
+}
+
 /// A single point along a route with geographic and distance data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutePoint {
@@ -8,6 +52,8 @@ pub struct RoutePoint {
     pub elevation_m: f64,
     pub distance_from_start_m: f64,
     pub grade_percent: Option<f64>,
+    #[serde(default)]
+    pub surface: SurfaceType,
 }
 
 /// A complete route: ordered list of points with metadata.

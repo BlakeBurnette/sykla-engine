@@ -1,4 +1,4 @@
-use crate::gradient::{elevation_at_distance, grade_at_distance};
+use crate::gradient::{elevation_at_distance, grade_at_distance, surface_at_distance};
 use crate::types::{RideState, Route};
 
 /// The ride engine: given a route and speed updates, tracks virtual position
@@ -43,8 +43,10 @@ impl RideEngine {
             return 0.0;
         }
 
-        // Convert speed to m/s and advance distance
-        let speed_ms = speed_kmh / 3.6;
+        // Apply surface rolling resistance to effective speed
+        let surface = surface_at_distance(&self.route.points, self.state.distance_m);
+        let resistance = surface.rolling_resistance();
+        let speed_ms = (speed_kmh / 3.6) / resistance;
         let distance_delta = speed_ms * dt_secs;
         self.state.distance_m += distance_delta;
         self.state.elapsed_secs += dt_secs;

@@ -112,10 +112,10 @@ mod tests {
 
     #[test]
     fn test_rasterize_straight_line() {
-        // Two nearby points should produce a connected line of cells
-        let points = vec![(35.7800, -78.6400), (35.7810, -78.6390)];
+        // Two points far enough apart to span multiple tiles at zoom 15
+        let points = vec![(35.7800, -78.6400), (35.7900, -78.6200)];
         let cells = rasterize_track(&points, 15);
-        assert!(cells.len() >= 2);
+        assert!(cells.len() >= 2, "Expected >= 2 cells, got {}", cells.len());
     }
 
     #[test]

@@ -599,6 +599,7 @@ async fn activity_to_route(
             elevation_m: p.elevation_m.unwrap_or(0.0) as f64,
             distance_from_start_m: p.distance_from_start_m as f64,
             grade_percent: p.grade_percent.map(|g| g as f64),
+            surface: Default::default(),
         })
         .collect();
 

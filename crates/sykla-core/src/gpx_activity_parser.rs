@@ -2,7 +2,7 @@ use crate::activity::{Activity, ActivityPoint, ActivitySource, BoundingBox};
 use crate::geo_math::haversine_distance;
 use crate::gradient::calculate_grades;
 use crate::types::RoutePoint;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use std::io::BufReader;
 use thiserror::Error;
 
@@ -28,40 +28,62 @@ pub enum GpxActivityError {
 /// - Cadence from `<extensions>` -> `gpxtpx:TrackPointExtension` -> `gpxtpx:cad`
 /// - Power from `<extensions>` -> `power` element (Garmin/Wahoo)
 /// - Speed computed from GPS delta / time delta
+/// Convert a gpx::Time to chrono::DateTime<Utc>.
+/// gpx 0.10 uses time::OffsetDateTime internally.
+fn gpx_time_to_chrono(t: gpx::Time) -> DateTime<Utc> {
+    let odt: time::OffsetDateTime = t.into();
+    let unix_ts = odt.unix_timestamp();
+    let nanos = odt.nanosecond();
+    Utc.timestamp_opt(unix_ts, nanos).single().unwrap_or_default()
+}
+
+/// Parse a GPX XML string into an Activity with full telemetry data.
+///
+/// Merges all tracks and segments into a single continuous activity.
+/// Multi-track GPX files (common from OSM exports) are fully supported.
 pub fn parse_gpx_activity(gpx_xml: &str) -> Result<Activity, GpxActivityError> {
     let reader = BufReader::new(gpx_xml.as_bytes());
     let gpx = gpx::read(reader).map_err(|e| GpxActivityError::ParseError(e.to_string()))?;
 
-    let track = gpx.tracks.first().ok_or(GpxActivityError::NoTrack)?;
-    let segment = track.segments.first().ok_or(GpxActivityError::NoSegments)?;
+    if gpx.tracks.is_empty() {
+        return Err(GpxActivityError::NoTrack);
+    }
 
-    if segment.points.is_empty() {
+    let name = gpx
+        .tracks
+        .first()
+        .and_then(|t| t.name.clone())
+        .unwrap_or_else(|| "Imported Activity".to_string());
+
+    // Collect all waypoints from all tracks and segments
+    let all_waypoints: Vec<&gpx::Waypoint> = gpx
+        .tracks
+        .iter()
+        .flat_map(|t| t.segments.iter())
+        .flat_map(|s| s.points.iter())
+        .collect();
+
+    if all_waypoints.is_empty() {
         return Err(GpxActivityError::NoPoints);
     }
 
-    let name = track
-        .name
-        .clone()
-        .unwrap_or_else(|| "Imported Activity".to_string());
-
     // Determine start time from the first point with a timestamp
-    let started_at: Option<DateTime<Utc>> = segment
-        .points
+    let started_at: Option<DateTime<Utc>> = all_waypoints
         .iter()
-        .find_map(|wp| wp.time.map(|t| t.into()));
+        .find_map(|wp| wp.time.map(gpx_time_to_chrono));
 
     // Build activity points
-    let mut points = Vec::with_capacity(segment.points.len());
+    let mut points = Vec::with_capacity(all_waypoints.len());
     let mut cumulative_distance = 0.0;
     let mut elevation_gain = 0.0;
 
-    for (i, wp) in segment.points.iter().enumerate() {
+    for (i, wp) in all_waypoints.iter().enumerate() {
         let lat = wp.point().y();
         let lng = wp.point().x();
         let elevation = wp.elevation;
 
         if i > 0 {
-            let prev = &segment.points[i - 1];
+            let prev = all_waypoints[i - 1];
             let d = haversine_distance(prev.point().y(), prev.point().x(), lat, lng);
             cumulative_distance += d;
 
@@ -76,7 +98,7 @@ pub fn parse_gpx_activity(gpx_xml: &str) -> Result<Activity, GpxActivityError> {
         // Compute timestamp_ms relative to activity start
         let timestamp_ms = match (wp.time, started_at) {
             (Some(t), Some(start)) => {
-                let t_utc: DateTime<Utc> = t.into();
+                let t_utc: DateTime<Utc> = gpx_time_to_chrono(t);
                 (t_utc - start).num_milliseconds()
             }
             _ => (i as i64) * 1000, // fallback: 1 second per point
@@ -87,11 +109,11 @@ pub fn parse_gpx_activity(gpx_xml: &str) -> Result<Activity, GpxActivityError> {
 
         // Compute speed from GPS delta/time delta
         let speed_kmh = if i > 0 {
-            let prev = &segment.points[i - 1];
+            let prev = all_waypoints[i - 1];
             let d = haversine_distance(prev.point().y(), prev.point().x(), lat, lng);
             let prev_ts = match (prev.time, started_at) {
                 (Some(t), Some(start)) => {
-                    let t_utc: DateTime<Utc> = t.into();
+                    let t_utc: DateTime<Utc> = gpx_time_to_chrono(t);
                     (t_utc - start).num_milliseconds()
                 }
                 _ => ((i - 1) as i64) * 1000,
@@ -129,6 +151,7 @@ pub fn parse_gpx_activity(gpx_xml: &str) -> Result<Activity, GpxActivityError> {
             elevation_m: p.elevation_m.unwrap_or(0.0),
             distance_from_start_m: p.distance_from_start_m,
             grade_percent: None,
+            surface: Default::default(),
         })
         .collect();
     calculate_grades(&mut route_points, 5);
@@ -312,5 +335,29 @@ mod tests {
                     > activity.points[i - 1].distance_from_start_m
             );
         }
+    }
+
+    #[test]
+    fn test_parse_gpx_activity_multi_track() {
+        let gpx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Multi-Track Ride</name>
+    <trkseg>
+      <trkpt lat="35.7796" lon="-78.6382"><ele>100.0</ele></trkpt>
+      <trkpt lat="35.7800" lon="-78.6380"><ele>102.0</ele></trkpt>
+    </trkseg>
+  </trk>
+  <trk>
+    <trkseg>
+      <trkpt lat="35.7805" lon="-78.6375"><ele>105.0</ele></trkpt>
+      <trkpt lat="35.7810" lon="-78.6370"><ele>108.0</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>"#;
+        let activity = parse_gpx_activity(gpx).unwrap();
+        assert_eq!(activity.name, "Multi-Track Ride");
+        assert_eq!(activity.points.len(), 4);
+        assert!(activity.total_distance_m > 0.0);
     }
 }

@@ -1,4 +1,4 @@
-use crate::types::RoutePoint;
+use crate::types::{RoutePoint, SurfaceType};
 
 /// Calculate gradient (grade %) between consecutive route points.
 /// Uses a smoothing window to reduce jitter from GPS noise.
@@ -108,6 +108,26 @@ pub fn elevation_at_distance(points: &[RoutePoint], distance_m: f64) -> f64 {
     p1.elevation_m + t * (p2.elevation_m - p1.elevation_m)
 }
 
+/// Get the surface type at a specific distance along the route.
+/// Returns the surface of the segment the rider is on (no interpolation — discrete).
+pub fn surface_at_distance(points: &[RoutePoint], distance_m: f64) -> SurfaceType {
+    if points.is_empty() {
+        return SurfaceType::default();
+    }
+    if distance_m <= 0.0 {
+        return points[0].surface;
+    }
+    if distance_m >= points.last().unwrap().distance_from_start_m {
+        return points.last().unwrap().surface;
+    }
+
+    let idx = points
+        .partition_point(|p| p.distance_from_start_m <= distance_m)
+        .saturating_sub(1);
+
+    points[idx].surface
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +141,7 @@ mod tests {
                 elevation_m: 100.0,
                 distance_from_start_m: 0.0,
                 grade_percent: None,
+                surface: Default::default(),
             },
             RoutePoint {
                 lat: 0.0,
@@ -128,6 +149,7 @@ mod tests {
                 elevation_m: 110.0,
                 distance_from_start_m: 100.0,
                 grade_percent: None,
+                surface: Default::default(),
             },
             RoutePoint {
                 lat: 0.0,
@@ -135,6 +157,7 @@ mod tests {
                 elevation_m: 120.0,
                 distance_from_start_m: 200.0,
                 grade_percent: None,
+                surface: Default::default(),
             },
             RoutePoint {
                 lat: 0.0,
@@ -142,6 +165,7 @@ mod tests {
                 elevation_m: 115.0,
                 distance_from_start_m: 300.0,
                 grade_percent: None,
+                surface: Default::default(),
             },
             RoutePoint {
                 lat: 0.0,
@@ -149,6 +173,7 @@ mod tests {
                 elevation_m: 100.0,
                 distance_from_start_m: 400.0,
                 grade_percent: None,
+                surface: Default::default(),
             },
         ]
     }

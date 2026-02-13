@@ -1,0 +1,12 @@
+[package]
+name = "sykla-godot"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sykla-core = { path = "../sykla-core" }
+sykla-world = { path = "../sykla-world" }
+godot = { git = "https://github.com/godot-rust/gdext", branch = "master" }

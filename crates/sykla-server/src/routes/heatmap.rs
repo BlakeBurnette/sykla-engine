@@ -312,6 +312,7 @@ async fn promote_corridor(
             elevation_m: elevation,
             distance_from_start_m: cumulative_distance,
             grade_percent: None,
+            surface: Default::default(),
         });
     }
 

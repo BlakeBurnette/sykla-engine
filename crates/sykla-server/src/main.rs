@@ -13,7 +13,8 @@ use auth::{auth_middleware, auth_router};
 use config::Config;
 use routes::{
     activities::activities_router, cities::cities_router, heatmap::heatmap_router,
-    rides::rides_router, routes_api::routes_router, users::users_router,
+    rides::rides_router, routes_api::routes_router,
+    users::users_router,
 };
 use ws::{new_global_room, new_room_manager, global_ws_handler, ws_handler, GlobalRoomHandle, RoomManager};
 

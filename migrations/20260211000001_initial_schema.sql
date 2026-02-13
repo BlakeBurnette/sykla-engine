@@ -1,6 +1,6 @@
 -- Sykla initial schema
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
@@ -9,7 +9,7 @@ CREATE TABLE users (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE routes (
+CREATE TABLE IF NOT EXISTS routes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),
     name VARCHAR(255) NOT NULL,
@@ -27,7 +27,7 @@ CREATE TABLE routes (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE route_points (
+CREATE TABLE IF NOT EXISTS route_points (
     id BIGSERIAL PRIMARY KEY,
     route_id UUID REFERENCES routes(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE route_points (
     UNIQUE(route_id, seq)
 );
 
-CREATE TABLE rides (
+CREATE TABLE IF NOT EXISTS rides (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),
     route_id UUID REFERENCES routes(id),
@@ -54,7 +54,7 @@ CREATE TABLE rides (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE live_positions (
+CREATE TABLE IF NOT EXISTS live_positions (
     user_id UUID REFERENCES users(id) PRIMARY KEY,
     route_id UUID REFERENCES routes(id),
     lat DOUBLE PRECISION,
@@ -66,9 +66,9 @@ CREATE TABLE live_positions (
 );
 
 -- Indexes
-CREATE INDEX idx_routes_user_id ON routes(user_id);
-CREATE INDEX idx_routes_is_public ON routes(is_public);
-CREATE INDEX idx_route_points_route_id ON route_points(route_id);
-CREATE INDEX idx_rides_user_id ON rides(user_id);
-CREATE INDEX idx_rides_route_id ON rides(route_id);
-CREATE INDEX idx_live_positions_route_id ON live_positions(route_id);
+CREATE INDEX IF NOT EXISTS idx_routes_user_id ON routes(user_id);
+CREATE INDEX IF NOT EXISTS idx_routes_is_public ON routes(is_public);
+CREATE INDEX IF NOT EXISTS idx_route_points_route_id ON route_points(route_id);
+CREATE INDEX IF NOT EXISTS idx_rides_user_id ON rides(user_id);
+CREATE INDEX IF NOT EXISTS idx_rides_route_id ON rides(route_id);
+CREATE INDEX IF NOT EXISTS idx_live_positions_route_id ON live_positions(route_id);

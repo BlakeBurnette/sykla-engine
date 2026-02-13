@@ -110,8 +110,8 @@ mod tests {
     #[test]
     fn test_generate_vegetation() {
         let points = vec![
-            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 100.0, distance_from_start_m: 0.0, grade_percent: Some(0.0) },
-            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 105.0, distance_from_start_m: 200.0, grade_percent: Some(2.5) },
+            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 100.0, distance_from_start_m: 0.0, grade_percent: Some(0.0), surface: Default::default() },
+            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 105.0, distance_from_start_m: 200.0, grade_percent: Some(2.5), surface: Default::default() },
         ];
 
         let veg = generate_vegetation(&points, &VegetationConfig::default());

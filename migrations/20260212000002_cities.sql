@@ -1,4 +1,4 @@
-CREATE TABLE cities (
+CREATE TABLE IF NOT EXISTS cities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     slug VARCHAR(100) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL,
@@ -15,4 +15,4 @@ CREATE TABLE cities (
     version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ DEFAULT now()
 );
-CREATE INDEX idx_cities_slug ON cities(slug);
+CREATE INDEX IF NOT EXISTS idx_cities_slug ON cities(slug);

@@ -1,7 +1,7 @@
 -- Activities: recorded outdoor rides with full GPS tracks and sensor data.
 -- Distinct from rides (indoor simulator sessions on pre-existing routes).
 
-CREATE TABLE activities (
+CREATE TABLE IF NOT EXISTS activities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id),
     name VARCHAR(255) NOT NULL DEFAULT 'Untitled Activity',
@@ -29,11 +29,11 @@ CREATE TABLE activities (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX idx_activities_user_id ON activities(user_id);
-CREATE INDEX idx_activities_started_at ON activities(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activities_user_id ON activities(user_id);
+CREATE INDEX IF NOT EXISTS idx_activities_started_at ON activities(started_at DESC);
 
 -- Per-second telemetry points for each activity.
-CREATE TABLE activity_points (
+CREATE TABLE IF NOT EXISTS activity_points (
     id BIGSERIAL PRIMARY KEY,
     activity_id UUID NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
     seq INT NOT NULL,
@@ -50,11 +50,11 @@ CREATE TABLE activity_points (
     UNIQUE(activity_id, seq)
 );
 
-CREATE INDEX idx_activity_points_activity_id ON activity_points(activity_id);
+CREATE INDEX IF NOT EXISTS idx_activity_points_activity_id ON activity_points(activity_id);
 
 -- Pre-aggregated spatial grid for heat map visualization.
 -- Uses Web Mercator tile math at zoom level 15 (~50m cells).
-CREATE TABLE heatmap_cells (
+CREATE TABLE IF NOT EXISTS heatmap_cells (
     zoom INT NOT NULL,
     grid_x INT NOT NULL,
     grid_y INT NOT NULL,
@@ -65,10 +65,10 @@ CREATE TABLE heatmap_cells (
     PRIMARY KEY (zoom, grid_x, grid_y)
 );
 
-CREATE INDEX idx_heatmap_cells_active ON heatmap_cells(ride_count) WHERE ride_count > 0;
+CREATE INDEX IF NOT EXISTS idx_heatmap_cells_active ON heatmap_cells(ride_count) WHERE ride_count > 0;
 
 -- Per-activity cell contributions for undo/recount when activities are deleted.
-CREATE TABLE heatmap_contributions (
+CREATE TABLE IF NOT EXISTS heatmap_contributions (
     activity_id UUID NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
     zoom INT NOT NULL,
     grid_x INT NOT NULL,
@@ -78,7 +78,7 @@ CREATE TABLE heatmap_contributions (
 );
 
 -- Auto-detected route corridors from heat map analysis.
-CREATE TABLE detected_corridors (
+CREATE TABLE IF NOT EXISTS detected_corridors (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     popularity_score REAL NOT NULL DEFAULT 0,
     is_loop BOOLEAN NOT NULL DEFAULT false,
@@ -88,4 +88,4 @@ CREATE TABLE detected_corridors (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX idx_detected_corridors_score ON detected_corridors(popularity_score DESC);
+CREATE INDEX IF NOT EXISTS idx_detected_corridors_score ON detected_corridors(popularity_score DESC);

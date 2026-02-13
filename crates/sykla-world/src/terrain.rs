@@ -161,10 +161,10 @@ mod tests {
 
     fn sample_points() -> Vec<RoutePoint> {
         vec![
-            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 100.0, distance_from_start_m: 0.0, grade_percent: Some(0.0) },
-            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 105.0, distance_from_start_m: 100.0, grade_percent: Some(5.0) },
-            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 110.0, distance_from_start_m: 200.0, grade_percent: Some(5.0) },
-            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 108.0, distance_from_start_m: 300.0, grade_percent: Some(-2.0) },
+            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 100.0, distance_from_start_m: 0.0, grade_percent: Some(0.0), surface: Default::default() },
+            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 105.0, distance_from_start_m: 100.0, grade_percent: Some(5.0), surface: Default::default() },
+            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 110.0, distance_from_start_m: 200.0, grade_percent: Some(5.0), surface: Default::default() },
+            RoutePoint { lat: 0.0, lng: 0.0, elevation_m: 108.0, distance_from_start_m: 300.0, grade_percent: Some(-2.0), surface: Default::default() },
         ]
     }
 
