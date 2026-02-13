@@ -13,7 +13,10 @@ credentials.json
 # City data (stored in GCS)
 *.sykla
 assets/cities/
+
+# Route GPX files (keep only the ones used by include_str! in routes.rs)
 assets/routes/
+!assets/routes/*.gpx
 
 # WASM build output
 web/dist/

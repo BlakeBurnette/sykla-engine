@@ -68,6 +68,7 @@ pub struct Renderer {
     pipeline_animated: wgpu::RenderPipeline,
     pipeline_cyclist: wgpu::RenderPipeline,
     pipeline_water: wgpu::RenderPipeline,
+    pipeline_emissive_instanced: wgpu::RenderPipeline,
     // Shadow pass pipelines
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_pipeline_instanced: wgpu::RenderPipeline,
@@ -103,8 +104,8 @@ fn hud_ortho_uniform(w: f32, h: f32) -> CameraUniform {
     }
 }
 
-const HUD_MAX_VERTS: usize = 32768;
-const HUD_MAX_INDICES: usize = 65536;
+const HUD_MAX_VERTS: usize = 4096;
+const HUD_MAX_INDICES: usize = 8192;
 
 impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>) -> Self {
@@ -626,6 +627,34 @@ impl Renderer {
                 cache: None,
             });
 
+        // Emissive instanced pipeline (cabin windows — no lighting, just fog)
+        let pipeline_emissive_instanced =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("emissive_instanced_pipeline"),
+                layout: Some(&main_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_instanced"),
+                    buffers: &[Vertex::layout(), InstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_emissive"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive,
+                depth_stencil: Some(depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
         // --- HUD pipeline ---
 
         let pipeline_hud =
@@ -732,6 +761,7 @@ impl Renderer {
             pipeline_animated,
             pipeline_cyclist,
             pipeline_water,
+            pipeline_emissive_instanced,
             shadow_pipeline,
             shadow_pipeline_instanced,
             shadow_pipeline_animated,
@@ -823,10 +853,31 @@ impl Renderer {
         })
     }
 
-    pub fn set_fog_color(&self, color: [f32; 3]) {
+    pub fn create_road_material(&self, color: [f32; 4], markings: bool) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color: color,
+            mid_color: color,
+            high_color: color,
+            zone_params: [if markings { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("road_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("road_material_bg"),
+            layout: &self.material_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    }
+
+    pub fn set_fog_color(&self, color: [f32; 4]) {
         let offset = std::mem::offset_of!(LightUniform, fog_color) as u64;
-        let data: [f32; 4] = [color[0], color[1], color[2], 1.0];
-        self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&data));
+        self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&color));
     }
 
     pub fn create_instance_buffer(&self, instances: &[InstanceData]) -> wgpu::Buffer {
@@ -916,6 +967,7 @@ impl Renderer {
         cyclist_draws: &[CyclistDrawCall],
         water_draws: &[DrawCall],
         sky_color: [f32; 3],
+        emissive_instanced_draws: &[InstancedDrawCall],
     ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -1069,6 +1121,19 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.shadow_bind_group, &[]);
             for call in cyclist_draws {
+                if call.instance_count == 0 { continue; }
+                pass.set_bind_group(1, &call.material_bind_group, &[]);
+                pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, call.instance_buffer.slice(..));
+                pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
+            }
+
+            // Emissive instanced draws (cabin windows — no lighting)
+            pass.set_pipeline(&self.pipeline_emissive_instanced);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            for call in emissive_instanced_draws {
                 if call.instance_count == 0 { continue; }
                 pass.set_bind_group(1, &call.material_bind_group, &[]);
                 pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));

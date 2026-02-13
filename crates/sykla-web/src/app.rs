@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
-use sykla_engine::camera::Camera;
+use sykla_engine::camera::{Camera, CameraMode};
+use sykla_engine::cyclist::{
+    CyclistInstanceData, NpcCyclist, generate_cyclist, spawn_npc_cyclists, update_cyclists,
+};
 use sykla_engine::glam::Vec3;
-use sykla_engine::hud::{build_hud, build_selector_hud};
+use sykla_engine::hud::{build_hud, build_selector_hud, camera_button_rects};
 use sykla_engine::mesh::{CpuMesh, GpuMesh, Vertex};
 use sykla_engine::physics::{PhysicsParams, PhysicsState, update_physics};
-use sykla_engine::renderer::{AnimatedDrawCall, DrawCall, InstancedDrawCall, Renderer};
+use sykla_engine::mountains::generate_mountain_ring;
+use sykla_engine::renderer::{AnimatedDrawCall, CyclistDrawCall, DrawCall, InstancedDrawCall, Renderer};
 use sykla_engine::road::{generate_roads_by_surface, RoadConfig};
-use sykla_engine::routes;
+use sykla_engine::routes::{self, RoadMarkings};
+use sykla_engine::structures;
 use sykla_engine::terrain::{
     generate_ground_plane, generate_terrain, interpolate_point, RoutePoint, SurfaceType,
     TerrainConfig,
@@ -21,7 +26,7 @@ use sykla_engine::wildlife::{
     generate_bird, generate_deer, generate_egret, generate_goose, generate_small_bird,
     generate_squirrel, generate_turtle, place_wildlife, AnimatedInstanceData,
 };
-use winit::event::{ElementState, KeyEvent};
+use winit::event::{ElementState, KeyEvent, TouchPhase};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
@@ -69,6 +74,14 @@ pub struct AppInner {
     // Ride engine (for route riding with trainer)
     ride_engine: Option<RideEngine>,
     sky_color: [f32; 3],
+    // Camera mode
+    camera_mode: CameraMode,
+    cursor_pos: (f32, f32),
+    // Cyclist rendering
+    cyclist_draws: Vec<CyclistDrawCall>,
+    cyclist_cpu: Vec<CyclistInstanceData>,
+    npc_cyclists: Vec<NpcCyclist>,
+    emissive_instanced_draws: Vec<InstancedDrawCall>,
 }
 
 impl AppInner {
@@ -99,6 +112,12 @@ impl AppInner {
             trainer: TrainerState::default(),
             ride_engine: None,
             sky_color: [0.52, 0.70, 0.82],
+            camera_mode: CameraMode::ThirdPersonClose,
+            cursor_pos: (0.0, 0.0),
+            cyclist_draws: Vec::new(),
+            cyclist_cpu: Vec::new(),
+            npc_cyclists: Vec::new(),
+            emissive_instanced_draws: Vec::new(),
         };
 
         // Start city data loading
@@ -158,6 +177,9 @@ impl AppInner {
                 KeyCode::Escape => {
                     self.state = AppState::Selecting;
                     self.ride_engine = None;
+                }
+                KeyCode::KeyC => {
+                    self.camera_mode = self.camera_mode.next();
                 }
                 KeyCode::Tab => {
                     if self.city_load.loaded {
@@ -278,7 +300,26 @@ impl AppInner {
             },
         ];
 
+        // Mountains — background ring of peaks using terrain material
+        if style.mountains {
+            let mountain_mesh = generate_mountain_ring(&self.route_points);
+            if !mountain_mesh.vertices.is_empty() {
+                let mountain_gpu = GpuMesh::from_cpu(&self.renderer.device, &mountain_mesh);
+                let mountain_mat = self.renderer.create_terrain_material(
+                    style.terrain_color,
+                    style.terrain_mid_color,
+                    style.terrain_high_color,
+                    style.elevation_zones,
+                );
+                self.draws.push(DrawCall {
+                    mesh: mountain_gpu,
+                    material_bind_group: mountain_mat,
+                });
+            }
+        }
+
         // Road segments
+        let has_markings = style.road_markings == RoadMarkings::European;
         self.road_draws = Vec::new();
         for (mesh, surface) in &road_segments {
             let color = match surface {
@@ -286,7 +327,7 @@ impl AppInner {
                 SurfaceType::Gravel => style.gravel_color,
             };
             let gpu = GpuMesh::from_cpu(&self.renderer.device, mesh);
-            let mat = self.renderer.create_material(color);
+            let mat = self.renderer.create_road_material(color, has_markings);
             self.road_draws.push(DrawCall {
                 mesh: gpu,
                 material_bind_group: mat,
@@ -527,6 +568,94 @@ impl AppInner {
             });
             self.flying_cpu.push(cpu_data);
         }
+
+        // --- Cabins + Snow banks ---
+        self.emissive_instanced_draws.clear();
+        if style.cabin_spacing_m > 0.0 {
+            let cabin_body_mesh = structures::generate_cabin_body();
+            let cabin_window_mesh = structures::generate_cabin_windows();
+            let cabin_instances = structures::place_cabins(
+                &self.route_points,
+                style.vegetation.treeline,
+                style.cabin_spacing_m,
+            );
+            if !cabin_instances.is_empty() {
+                let body_gpu = GpuMesh::from_cpu(&self.renderer.device, &cabin_body_mesh);
+                let window_gpu = GpuMesh::from_cpu(&self.renderer.device, &cabin_window_mesh);
+                let body_mat = self.renderer.create_material([0.40, 0.28, 0.15, 1.0]);
+                let window_mat = self.renderer.create_material([2.5, 1.8, 0.8, 1.0]);
+                let body_buf = self.renderer.create_instance_buffer(&cabin_instances);
+                let window_buf = self.renderer.create_instance_buffer(&cabin_instances);
+                let count = cabin_instances.len() as u32;
+
+                self.instanced_draws.push(InstancedDrawCall {
+                    mesh: body_gpu,
+                    instance_buffer: body_buf,
+                    instance_count: count,
+                    material_bind_group: body_mat,
+                });
+                self.emissive_instanced_draws.push(InstancedDrawCall {
+                    mesh: window_gpu,
+                    instance_buffer: window_buf,
+                    instance_count: count,
+                    material_bind_group: window_mat,
+                });
+            }
+        }
+
+        // Snow banks
+        if style.elevation_zones[0] < 90000.0 {
+            let snow_start = style.elevation_zones[0];
+            let snow_instances = structures::place_snow_banks(
+                &self.route_points,
+                RoadConfig::default().half_width,
+                snow_start,
+            );
+            if !snow_instances.is_empty() {
+                let snow_mesh = structures::generate_snow_bank();
+                let snow_gpu = GpuMesh::from_cpu(&self.renderer.device, &snow_mesh);
+                let snow_mat = self.renderer.create_material([0.88, 0.90, 0.95, 1.0]);
+                let snow_buf = self.renderer.create_instance_buffer(&snow_instances);
+                let count = snow_instances.len() as u32;
+
+                self.instanced_draws.push(InstancedDrawCall {
+                    mesh: snow_gpu,
+                    instance_buffer: snow_buf,
+                    instance_count: count,
+                    material_bind_group: snow_mat,
+                });
+            }
+        }
+
+        // Cyclists
+        self.npc_cyclists = spawn_npc_cyclists(self.route_length, 20);
+        let cyclist_mesh_cpu = generate_cyclist();
+        let cyclist_gpu = GpuMesh::from_cpu(&self.renderer.device, &cyclist_mesh_cpu);
+        let cyclist_mat = self.renderer.create_material([0.15, 0.30, 0.65, 1.0]);
+
+        self.cyclist_cpu = update_cyclists(
+            &mut self.npc_cyclists,
+            &self.route_points,
+            self.route_length,
+            0.0,
+        );
+        // Reserve slot for the player cyclist (scale 0 = invisible placeholder)
+        self.cyclist_cpu.push(CyclistInstanceData {
+            position: [0.0, 0.0, 0.0],
+            scale: 0.0,
+            forward: [0.0, 1.0],
+            pedal_phase: 0.0,
+            _pad: 0.0,
+        });
+        let cyclist_buf = self.renderer.create_cyclist_instance_buffer(&self.cyclist_cpu);
+        let cyclist_count = self.cyclist_cpu.len() as u32;
+
+        self.cyclist_draws = vec![CyclistDrawCall {
+            mesh: cyclist_gpu,
+            instance_buffer: cyclist_buf,
+            instance_count: cyclist_count,
+            material_bind_group: cyclist_mat,
+        }];
     }
 
     fn route_name(&self) -> &'static str {
@@ -560,7 +689,7 @@ impl AppInner {
         self.renderer.update_camera(&self.camera, 0.0);
         self.renderer.update_hud(&hud_verts, &hud_indices);
 
-        match self.renderer.render(&[], &[], &[], &[], &[], &[], self.sky_color) {
+        match self.renderer.render(&[], &[], &[], &[], &[], &[], self.sky_color, &[]) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
                 let (w, h) = (self.renderer.width, self.renderer.height);
@@ -592,23 +721,27 @@ impl AppInner {
             dt,
         );
 
-        // Camera follows curved route
+        // Camera follows curved route (mode-based)
         let dist = self.physics_state.distance;
         let (px, pz, elev_here, fx, fz) =
             interpolate_point(&self.route_points, dist as f64);
-        let (ax, az, elev_ahead, _, _) =
-            interpolate_point(&self.route_points, (dist + 50.0) as f64);
-        let elev_max = elev_here.max(elev_ahead);
+
+        let (behind, up, lateral, look_ahead, fov) = self.camera_mode.camera_params();
+        self.camera.fov_y = fov.to_radians();
 
         let perp_x = -fz;
         let perp_z = fx;
 
         self.camera.eye = Vec3::new(
-            px + perp_x * (-2.0) - fx * 8.0,
-            elev_here + 5.5,
-            pz + perp_z * (-2.0) - fz * 8.0,
+            px + perp_x * lateral - fx * behind,
+            elev_here + up,
+            pz + perp_z * lateral - fz * behind,
         );
-        self.camera.target = Vec3::new(ax, elev_max + 2.0, az);
+
+        let (ax, az, elev_ahead, _, _) =
+            interpolate_point(&self.route_points, (dist + look_ahead) as f64);
+        let target_elev = elev_here.max(elev_ahead) + 2.0;
+        self.camera.target = Vec3::new(ax, target_elev, az);
 
         self.renderer.update_camera(&self.camera, t);
 
@@ -618,6 +751,7 @@ impl AppInner {
             &self.physics_state,
             self.route_length,
             route_name,
+            self.camera_mode,
             self.renderer.width as f32,
             self.renderer.height as f32,
         );
@@ -639,6 +773,32 @@ impl AppInner {
             );
         }
 
+        // Update cyclist positions
+        self.cyclist_cpu = update_cyclists(
+            &mut self.npc_cyclists,
+            &self.route_points,
+            self.route_length,
+            dt,
+        );
+        // Add player cyclist (visible in 3rd-person modes)
+        if self.camera_mode != CameraMode::FirstPerson {
+            self.cyclist_cpu.push(CyclistInstanceData {
+                position: [px, elev_here, pz],
+                scale: 1.0,
+                forward: [fx, fz],
+                pedal_phase: 0.0,
+                _pad: 0.0,
+            });
+        }
+        if !self.cyclist_draws.is_empty() {
+            self.cyclist_draws[0].instance_count = self.cyclist_cpu.len() as u32;
+            self.renderer.queue.write_buffer(
+                &self.cyclist_draws[0].instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.cyclist_cpu),
+            );
+        }
+
         self.renderer.update_hud(&hud_verts, &hud_indices);
 
         match self.renderer.render(
@@ -646,9 +806,10 @@ impl AppInner {
             &self.road_draws,
             &self.instanced_draws,
             &self.animated_draws,
-            &[],
+            &self.cyclist_draws,
             &self.water_draws,
             self.sky_color,
+            &self.emissive_instanced_draws,
         ) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
@@ -693,6 +854,7 @@ impl AppInner {
             &[],
             &self.water_draws,
             self.sky_color,
+            &[],
         ) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
@@ -768,6 +930,35 @@ impl AppInner {
         self.animated_draws.clear();
         self.flying_cpu.clear();
         self.water_draws.clear();
+    }
+
+    pub fn handle_cursor_move(&mut self, x: f32, y: f32) {
+        self.cursor_pos = (x, y);
+    }
+
+    pub fn handle_click(&mut self) {
+        if self.state != AppState::Riding {
+            return;
+        }
+        let rects = camera_button_rects(
+            self.renderer.width as f32,
+            self.renderer.height as f32,
+        );
+        let (cx, cy) = self.cursor_pos;
+        let modes = [CameraMode::ThirdPersonClose, CameraMode::ThirdPersonFar, CameraMode::FirstPerson];
+        for (i, (x, y, w, h)) in rects.iter().enumerate() {
+            if cx >= *x && cx <= x + w && cy >= *y && cy <= y + h {
+                self.camera_mode = modes[i];
+                return;
+            }
+        }
+    }
+
+    pub fn handle_touch(&mut self, touch: winit::event::Touch) {
+        if touch.phase == TouchPhase::Ended {
+            self.cursor_pos = (touch.location.x as f32, touch.location.y as f32);
+            self.handle_click();
+        }
     }
 }
 

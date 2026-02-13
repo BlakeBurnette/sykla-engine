@@ -107,50 +107,48 @@ pub fn generate_cyclist() -> CpuMesh {
     // Rider (aggressive road racing tuck, ~40-45° torso lean)
     // ==========================================================
 
-    // --- Torso (3 overlapping ellipsoids) ---
-    // Lower torso (hips/pelvis) — wide and flat
-    add_ellipsoid(&mut vertices, &mut indices,
-        0.0, 0.94, -0.04, 0.14, 0.10, 0.10, 6, 12);
-    // Mid torso (waist) — connecting volume
-    add_ellipsoid(&mut vertices, &mut indices,
-        0.0, 1.06, 0.06, 0.12, 0.10, 0.09, 5, 10);
-    // Upper torso (chest/shoulders) — broader
-    add_ellipsoid(&mut vertices, &mut indices,
-        0.0, 1.18, 0.14, 0.16, 0.12, 0.10, 6, 12);
+    // --- Torso (smooth tapered cylinder + subtle volume) ---
+    let hip_center: [f32; 3] = [0.0, 0.90, -0.06];
+    let shoulder_center: [f32; 3] = [0.0, 1.26, 0.20];
 
-    // Shoulder caps
+    // Core torso cylinder: narrower at hips, wider at shoulders
+    add_cylinder(&mut vertices, &mut indices,
+        hip_center, 0.10, shoulder_center, 0.12, s);
+    // Hip/pelvis width (flat, just adds lateral volume)
     add_ellipsoid(&mut vertices, &mut indices,
-        0.16, 1.28, 0.20, 0.06, 0.05, 0.05, 5, 10);
+        0.0, 0.92, -0.05, 0.14, 0.05, 0.08, 5, 10);
+    // Chest/back depth (adds volume to upper torso)
     add_ellipsoid(&mut vertices, &mut indices,
-        -0.16, 1.28, 0.20, 0.06, 0.05, 0.05, 5, 10);
+        0.0, 1.18, 0.16, 0.13, 0.08, 0.10, 5, 10);
 
-    // --- Head + aero helmet ---
+    // --- Neck ---
+    add_cylinder(&mut vertices, &mut indices,
+        shoulder_center, 0.04, [0.0, 1.32, 0.24], 0.035, s);
+
+    // --- Head + aero helmet (single elongated ellipsoid) ---
     add_ellipsoid(&mut vertices, &mut indices,
-        0.0, 1.36, 0.28, 0.08, 0.10, 0.09, 6, 12);
-    // Aero tail (elongated rearward)
-    add_ellipsoid(&mut vertices, &mut indices,
-        0.0, 1.38, 0.20, 0.05, 0.05, 0.12, 5, 10);
+        0.0, 1.38, 0.28, 0.09, 0.10, 0.13, 6, 12);
 
     // --- Arms ---
-    let sh_x = 0.16;
-    let elbow_r: [f32; 3] = [0.18, 1.08, 0.34];
-    let elbow_l: [f32; 3] = [-0.18, 1.08, 0.34];
-    let hand_r: [f32; 3] = [0.18, 0.88, 0.46];
-    let hand_l: [f32; 3] = [-0.18, 0.88, 0.46];
+    let sh_x = 0.18;
+    let elbow_r: [f32; 3] = [0.20, 1.06, 0.34];
+    let elbow_l: [f32; 3] = [-0.20, 1.06, 0.34];
+    let hand_r: [f32; 3] = [0.20, 0.88, 0.46];
+    let hand_l: [f32; 3] = [-0.20, 0.88, 0.46];
 
     // Upper arms
     add_cylinder(&mut vertices, &mut indices,
-        [sh_x, 1.28, 0.20], 0.040, elbow_r, 0.035, s);
+        [sh_x, 1.26, 0.20], 0.045, elbow_r, 0.038, s);
     add_cylinder(&mut vertices, &mut indices,
-        [-sh_x, 1.28, 0.20], 0.040, elbow_l, 0.035, s);
+        [-sh_x, 1.26, 0.20], 0.045, elbow_l, 0.038, s);
 
     // Lower arms
     add_cylinder(&mut vertices, &mut indices,
-        elbow_r, 0.035, hand_r, 0.028, s);
+        elbow_r, 0.038, hand_r, 0.030, s);
     add_cylinder(&mut vertices, &mut indices,
-        elbow_l, 0.035, hand_l, 0.028, s);
+        elbow_l, 0.038, hand_l, 0.030, s);
 
-    // Hands (small ellipsoids at grip points)
+    // Hands
     add_ellipsoid(&mut vertices, &mut indices,
         hand_r[0], hand_r[1], hand_r[2], 0.025, 0.020, 0.030, 5, 10);
     add_ellipsoid(&mut vertices, &mut indices,

@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_time::Instant;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::web::WindowAttributesExtWebSys;
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -81,6 +81,21 @@ impl ApplicationHandler for WebApp {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(ref mut app) = *self.inner.borrow_mut() {
                     app.handle_key(&event);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(ref mut app) = *self.inner.borrow_mut() {
+                    app.handle_cursor_move(position.x as f32, position.y as f32);
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if let Some(ref mut app) = *self.inner.borrow_mut() {
+                    app.handle_click();
+                }
+            }
+            WindowEvent::Touch(touch) => {
+                if let Some(ref mut app) = *self.inner.borrow_mut() {
+                    app.handle_touch(touch);
                 }
             }
             WindowEvent::RedrawRequested => {

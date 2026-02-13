@@ -1,6 +1,12 @@
 use crate::terrain::{RoutePoint, SurfaceType};
 use crate::vegetation::VegetationConfig;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum RoadMarkings {
+    None,
+    European,
+}
+
 /// Visual style parameters that control how the world looks for a given route.
 pub struct RouteStyle {
     /// Terrain mesh color [r, g, b, a] — low elevation / base zone
@@ -27,10 +33,16 @@ pub struct RouteStyle {
     pub bush_color: [f32; 4],
     /// Vegetation density config
     pub vegetation: VegetationConfig,
-    /// Fog / atmospheric haze color
-    pub fog_color: [f32; 3],
+    /// Fog / atmospheric haze color [r, g, b, base_elevation]
+    pub fog_color: [f32; 4],
     /// Sky clear color
     pub sky_color: [f32; 3],
+    /// Road marking style
+    pub road_markings: RoadMarkings,
+    /// Cabin spacing in meters (0.0 = no cabins)
+    pub cabin_spacing_m: f32,
+    /// Whether to generate background mountains
+    pub mountains: bool,
 }
 
 impl RouteStyle {
@@ -49,8 +61,11 @@ impl RouteStyle {
             pine_color: [0.06, 0.22, 0.04, 1.0],
             bush_color: [0.14, 0.35, 0.08, 1.0],
             vegetation: VegetationConfig::default(),
-            fog_color: [0.72, 0.68, 0.52],
+            fog_color: [0.72, 0.68, 0.52, 80.0],
             sky_color: [0.52, 0.70, 0.82],
+            road_markings: RoadMarkings::None,
+            cabin_spacing_m: 0.0,
+            mountains: false,
         }
     }
 
@@ -77,8 +92,42 @@ impl RouteStyle {
                 max_scale: 0.7,
                 treeline: 1900.0,
             },
-            fog_color: [0.78, 0.82, 0.90],
+            fog_color: [0.78, 0.82, 0.90, 700.0],
             sky_color: [0.55, 0.72, 0.88],
+            road_markings: RoadMarkings::European,
+            cabin_spacing_m: 500.0,
+            mountains: true,
+        }
+    }
+
+    /// High alpine winter — snow from start, Col de la Loze
+    fn high_alpine_winter() -> Self {
+        Self {
+            terrain_color: [0.42, 0.48, 0.35, 1.0],       // Muted winter grass
+            terrain_mid_color: [0.72, 0.74, 0.78, 1.0],    // Patchy snow/rock
+            terrain_high_color: [0.92, 0.94, 0.97, 1.0],   // Deep snow
+            elevation_zones: [1350.0, 1550.0, 1700.0, 1900.0],
+            ground_color: [0.35, 0.32, 0.28, 1.0],
+            road_color: [0.22, 0.22, 0.24, 1.0],           // Wet dark asphalt
+            gravel_color: [0.22, 0.22, 0.24, 1.0],
+            trunk_color: [0.25, 0.18, 0.10, 1.0],
+            canopy_color: [0.15, 0.25, 0.10, 1.0],
+            pine_color: [0.10, 0.20, 0.08, 1.0],
+            bush_color: [0.20, 0.28, 0.12, 1.0],
+            vegetation: VegetationConfig {
+                spacing_m: 6.0,
+                min_distance: 4.0,
+                max_distance: 60.0,
+                trees_per_slot: 4,
+                min_scale: 0.3,
+                max_scale: 0.7,
+                treeline: 1800.0,
+            },
+            fog_color: [0.82, 0.85, 0.92, 1400.0],
+            sky_color: [0.62, 0.72, 0.85],
+            road_markings: RoadMarkings::European,
+            cabin_spacing_m: 500.0,
+            mountains: true,
         }
     }
 
@@ -105,8 +154,11 @@ impl RouteStyle {
                 max_scale: 0.5,
                 ..Default::default()
             },
-            fog_color: [0.72, 0.68, 0.52],
+            fog_color: [0.72, 0.68, 0.52, 300.0],
             sky_color: [0.52, 0.70, 0.82],
+            road_markings: RoadMarkings::None,
+            cabin_spacing_m: 0.0,
+            mountains: false,
         }
     }
 
@@ -133,8 +185,11 @@ impl RouteStyle {
                 max_scale: 0.9,
                 ..Default::default()
             },
-            fog_color: [0.72, 0.68, 0.52],
+            fog_color: [0.72, 0.68, 0.52, 10.0],
             sky_color: [0.52, 0.70, 0.82],
+            road_markings: RoadMarkings::None,
+            cabin_spacing_m: 0.0,
+            mountains: false,
         }
     }
 
@@ -161,8 +216,11 @@ impl RouteStyle {
                 max_scale: 1.2,
                 ..Default::default()
             },
-            fog_color: [0.72, 0.68, 0.52],
+            fog_color: [0.72, 0.68, 0.52, 80.0],
             sky_color: [0.52, 0.70, 0.82],
+            road_markings: RoadMarkings::None,
+            cabin_spacing_m: 0.0,
+            mountains: false,
         }
     }
 }
@@ -240,7 +298,7 @@ pub fn route_style(key: &str) -> RouteStyle {
         "stelvio" => RouteStyle::alpine(),
         "blue-ridge" => RouteStyle::forest(),
         "pacific-coast" => RouteStyle::coastal(),
-        "col-de-la-loze" => RouteStyle::alpine(),
+        "col-de-la-loze" => RouteStyle::high_alpine_winter(),
         _ => RouteStyle::forest(),
     }
 }

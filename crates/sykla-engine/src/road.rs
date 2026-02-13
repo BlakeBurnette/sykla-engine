@@ -19,11 +19,10 @@ impl Default for RoadConfig {
 
 pub fn generate_road(points: &[RoutePoint], config: &RoadConfig) -> CpuMesh {
     let mut vertices = Vec::with_capacity(points.len() * 2);
-    let total_dist = points.last().map(|p| p.distance_m).unwrap_or(1.0) as f32;
 
     for point in points {
         let y = point.elevation_m as f32 * config.elevation_scale + config.y_offset;
-        let v = point.distance_m as f32 / total_dist;
+        let v = point.distance_m as f32;
         let perp_x = -point.forward_z;
         let perp_z = point.forward_x;
 

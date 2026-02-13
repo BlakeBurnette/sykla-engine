@@ -221,7 +221,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Atmospheric haze from fog uniform
     let dist = length(camera.eye_pos.xyz - in.world_pos);
-    let height_factor = clamp((in.world_pos.y - 80.0) / 80.0, 0.0, 1.0);
+    let base_elev = light.fog_color.w;
+    let height_factor = clamp((in.world_pos.y - base_elev) / 200.0, 0.0, 1.0);
     let fog_density = (1.0 - height_factor * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
     color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
 
@@ -250,7 +251,21 @@ fn fs_road(in: VertexOutput) -> @location(0) vec4<f32> {
     // Road edge darkening — darken near uv.x = 0 or 1
     let edge = abs(in.uv.x - 0.5) * 2.0; // 0 at center, 1 at edge
     let edge_darken = 1.0 - edge * edge * 0.25;
-    let base_color = color_var * edge_darken;
+    var base_color = color_var * edge_darken;
+
+    // European road markings (when zone_params.x > 0.5)
+    if (material.zone_params.x > 0.5) {
+        let road_dist = in.uv.y; // meters along route
+        let ux = in.uv.x;
+        // Center dashed: 3m on, 3m off (6m period), 0.5m wide at center
+        let center = smoothstep(0.48, 0.485, ux) * (1.0 - smoothstep(0.515, 0.52, ux));
+        let dash = step(0.5, fract(road_dist / 6.0));
+        // Solid edge lines: ~0.3m wide at each edge
+        let left_edge = smoothstep(0.02, 0.03, ux) * (1.0 - smoothstep(0.06, 0.07, ux));
+        let right_edge = smoothstep(0.93, 0.94, ux) * (1.0 - smoothstep(0.97, 0.98, ux));
+        let mark = clamp(center * dash + left_edge + right_edge, 0.0, 1.0);
+        base_color = mix(base_color, vec3<f32>(0.92, 0.92, 0.88), mark * 0.85);
+    }
 
     // Lighting (simpler than terrain — no subsurface)
     let NdotL = dot(N, L);
@@ -267,8 +282,9 @@ fn fs_road(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Same atmospheric haze from fog uniform
     let dist = length(camera.eye_pos.xyz - in.world_pos);
-    let height_factor = clamp((in.world_pos.y - 80.0) / 80.0, 0.0, 1.0);
-    let fog_density = (1.0 - height_factor * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
+    let base_elev_r = light.fog_color.w;
+    let height_factor_r = clamp((in.world_pos.y - base_elev_r) / 200.0, 0.0, 1.0);
+    let fog_density = (1.0 - height_factor_r * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
     color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
 
     // Tone mapping
@@ -419,14 +435,30 @@ fn fs_water(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Same fog as fs_main — from uniform
     let dist = length(camera.eye_pos.xyz - in.world_pos);
-    let height_factor = clamp((in.world_pos.y - 80.0) / 80.0, 0.0, 1.0);
-    let fog_density = (1.0 - height_factor * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
+    let base_elev_w = light.fog_color.w;
+    let height_factor_w = clamp((in.world_pos.y - base_elev_w) / 200.0, 0.0, 1.0);
+    let fog_density = (1.0 - height_factor_w * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
     color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
 
     // Tone mapping
     color = color / (color + vec3<f32>(1.0));
 
     return vec4<f32>(color, 0.85);
+}
+
+// ── Emissive fragment shader (cabin windows, no lighting) ───────
+
+@fragment
+fn fs_emissive(in: VertexOutput) -> @location(0) vec4<f32> {
+    var color = material.base_color.xyz;
+    // Fog only, no lighting
+    let dist = length(camera.eye_pos.xyz - in.world_pos);
+    let base_elev_e = light.fog_color.w;
+    let height_factor_e = clamp((in.world_pos.y - base_elev_e) / 200.0, 0.0, 1.0);
+    let fog_density = (1.0 - height_factor_e * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
+    color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
+    color = color / (color + vec3<f32>(1.0));
+    return vec4<f32>(color, 1.0);
 }
 
 // ── HUD vertex + fragment shaders ───────────────────────────────

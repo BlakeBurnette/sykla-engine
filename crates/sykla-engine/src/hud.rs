@@ -1,3 +1,4 @@
+use crate::camera::CameraMode;
 use crate::mesh::Vertex;
 use crate::physics::PhysicsState;
 
@@ -153,8 +154,8 @@ pub fn build_selector_hud(
     width: f32,
     height: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
-    let mut verts = Vec::with_capacity(16384);
-    let mut indices = Vec::with_capacity(32768);
+    let mut verts = Vec::with_capacity(4096);
+    let mut indices = Vec::with_capacity(8192);
 
     let scale = (width / 1440.0).clamp(0.5, 2.0);
 
@@ -181,32 +182,15 @@ pub fn build_selector_hud(
 
     // Route list
     let list_top = title_y + title_size * 2.5;
-    let row_h = 32.0 * scale;
+    let row_h = 28.0 * scale;
     let name_size = 8.0 * scale;
     let desc_size = 5.0 * scale;
     let list_w = 500.0 * scale;
     let list_x = (width - list_w) * 0.5;
     let padding = 12.0 * scale;
 
-    // Scroll: compute how many rows fit and the scroll offset
-    let hint_y_reserved = 50.0 * scale;
-    let list_avail_h = height - list_top - hint_y_reserved;
-    let max_visible = (list_avail_h / row_h).floor() as usize;
-    let max_visible = max_visible.max(1);
-    let scroll_offset = if routes.len() <= max_visible {
-        0
-    } else if selected < max_visible / 2 {
-        0
-    } else if selected + max_visible / 2 >= routes.len() {
-        routes.len().saturating_sub(max_visible)
-    } else {
-        selected.saturating_sub(max_visible / 2)
-    };
-    let visible_end = (scroll_offset + max_visible).min(routes.len());
-
-    for i in scroll_offset..visible_end {
-        let (name, desc) = routes[i];
-        let y = list_top + (i - scroll_offset) as f32 * row_h;
+    for (i, &(name, desc)) in routes.iter().enumerate() {
+        let y = list_top + i as f32 * row_h;
         let is_selected = i == selected;
 
         // Row background (highlight for selected)
@@ -259,30 +243,6 @@ pub fn build_selector_hud(
         );
     }
 
-    // Scroll indicators
-    let indicator_size = 5.0 * scale;
-    if scroll_offset > 0 {
-        let arrow = "...";
-        let aw = text_width(arrow, indicator_size);
-        push_text(
-            &mut verts, &mut indices,
-            arrow, list_x + (list_w - aw) * 0.5, list_top - indicator_size * 1.8,
-            indicator_size, indicator_size * 1.4,
-            0.4, 0.4, 0.5, 0.6,
-        );
-    }
-    if visible_end < routes.len() {
-        let arrow = "...";
-        let aw = text_width(arrow, indicator_size);
-        let bottom_y = list_top + (visible_end - scroll_offset) as f32 * row_h;
-        push_text(
-            &mut verts, &mut indices,
-            arrow, list_x + (list_w - aw) * 0.5, bottom_y + 2.0 * scale,
-            indicator_size, indicator_size * 1.4,
-            0.4, 0.4, 0.5, 0.6,
-        );
-    }
-
     // Footer hint
     let hint = "ENTER TO RIDE  -  ESC TO RETURN";
     let hint_size = 6.0 * scale;
@@ -300,12 +260,31 @@ pub fn build_selector_hud(
     (verts, indices)
 }
 
+/// Returns `(x, y, w, h)` for each of the 3 camera buttons in order:
+/// ThirdPersonClose, ThirdPersonFar, FirstPerson.
+pub fn camera_button_rects(width: f32, height: f32) -> [(f32, f32, f32, f32); 3] {
+    let scale = (width / 1440.0).clamp(0.5, 2.0);
+    let margin = 12.0 * scale;
+    let btn_w = 120.0 * scale;
+    let btn_h = 28.0 * scale;
+    let btn_gap = 4.0 * scale;
+    let panel_h = 3.0 * btn_h + 2.0 * btn_gap;
+    let x = width - margin - btn_w;
+    let y_start = height - margin - panel_h;
+    [
+        (x, y_start, btn_w, btn_h),
+        (x, y_start + btn_h + btn_gap, btn_w, btn_h),
+        (x, y_start + 2.0 * (btn_h + btn_gap), btn_w, btn_h),
+    ]
+}
+
 pub fn build_hud(
     state: &PhysicsState,
     route_length: f32,
     route_name: &str,
+    camera_mode: CameraMode,
     width: f32,
-    _height: f32,
+    height: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::with_capacity(4096);
     let mut indices = Vec::with_capacity(8192);
@@ -496,6 +475,38 @@ pub fn build_hud(
             name_size, name_size * 1.4,
             0.4, 0.4, 0.45, 0.6,
         );
+    }
+
+    // ================================================================
+    // BOTTOM-RIGHT — camera mode buttons
+    // ================================================================
+    let modes = [CameraMode::ThirdPersonClose, CameraMode::ThirdPersonFar, CameraMode::FirstPerson];
+    let rects = camera_button_rects(width, height);
+    let btn_text_size = 6.0 * scale;
+
+    for (i, &mode) in modes.iter().enumerate() {
+        let (bx, by, bw, bh) = rects[i];
+        let active = mode == camera_mode;
+
+        // Button background
+        let (bg_r, bg_g, bg_b, bg_a) = if active {
+            (0.20, 0.45, 0.85, 0.85)
+        } else {
+            (0.08, 0.08, 0.12, 0.60)
+        };
+        push_quad(&mut verts, &mut indices, bx, by, bw, bh, bg_r, bg_g, bg_b, bg_a);
+
+        // Button label
+        let label = mode.label();
+        let tw = text_width(label, btn_text_size);
+        let tx = bx + (bw - tw) * 0.5;
+        let ty = by + (bh - btn_text_size * 1.4) * 0.5;
+        let (tr, tg, tb) = if active {
+            (1.0, 1.0, 1.0)
+        } else {
+            (0.45, 0.45, 0.50)
+        };
+        push_text(&mut verts, &mut indices, label, tx, ty, btn_text_size, btn_text_size * 1.4, tr, tg, tb, 1.0);
     }
 
     (verts, indices)
