@@ -36,8 +36,9 @@ RUN mkdir -p crates/sykla-core/src && echo "// dummy" > crates/sykla-core/src/li
 # Build dependencies only (cached layer)
 RUN cargo build --release -p sykla-server 2>/dev/null || true
 
-# Copy real source code
+# Copy real source code + assets needed by include_str!
 COPY crates/ crates/
+COPY assets/ assets/
 COPY migrations/ migrations/
 
 # Force cargo to detect source changes (touch + remove old artifacts)
