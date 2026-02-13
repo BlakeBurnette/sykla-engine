@@ -416,6 +416,10 @@ pub struct VegetationConfig {
     pub trees_per_slot: usize,
     pub min_scale: f32,
     pub max_scale: f32,
+    /// Elevation above which trees thin out and eventually disappear.
+    /// Trees are fully absent above treeline + 200m.
+    /// Default 99999.0 = no treeline (all vegetation placed normally).
+    pub treeline: f32,
 }
 
 impl Default for VegetationConfig {
@@ -427,6 +431,7 @@ impl Default for VegetationConfig {
             trees_per_slot: 5,
             min_scale: 0.7,
             max_scale: 1.15,
+            treeline: 99999.0,
         }
     }
 }
@@ -496,7 +501,27 @@ fn place_one(
     let (px, pz, y, fx, fz) = interpolate_point(points, dist_along);
     let (wx, wz) = offset_position(px, pz, fx, fz, side * x_off);
 
-    if kind < 0.35 {
+    // Treeline thinning: above treeline + 200m → skip entirely
+    // Between treeline and treeline + 200m → probabilistic thinning
+    if y > config.treeline + 200.0 {
+        return;
+    }
+    if y > config.treeline {
+        let thin_t = (y - config.treeline) / 200.0; // 0 at treeline, 1 at +200m
+        if next_rng(rng) < thin_t {
+            return;
+        }
+    }
+
+    // At higher elevations (approaching treeline), shift ratio toward pine
+    let elev_pine_bias = if config.treeline < 90000.0 {
+        let t = ((y - (config.treeline - 400.0)) / 400.0).clamp(0.0, 1.0);
+        t * 0.3 // up to 30% extra pine probability near treeline
+    } else {
+        0.0
+    };
+
+    if kind < 0.35 - elev_pine_bias {
         // Oak
         if age < 0.35 {
             let scale = 0.25 + next_rng(rng) * 0.25;
@@ -505,7 +530,7 @@ fn place_one(
             let scale = config.min_scale + next_rng(rng) * (config.max_scale - config.min_scale);
             deciduous.push(InstanceData { position: [wx, y, wz], scale });
         }
-    } else if kind < 0.65 {
+    } else if kind < 0.65 + elev_pine_bias {
         // Pine
         if age < 0.30 {
             let scale = 0.20 + next_rng(rng) * 0.25;

@@ -8,6 +8,7 @@ mod ws;
 use axum::{middleware, routing::get, Router};
 use sqlx::PgPool;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 
 use auth::{auth_middleware, auth_router};
 use config::Config;
@@ -77,9 +78,18 @@ async fn main() {
         .nest("/api/users", users_router())
         .layer(middleware::from_fn(auth_middleware));
 
+    // Serve web/ static files (WASM frontend) with index.html fallback
+    let web_dir = std::env::var("WEB_DIR").unwrap_or_else(|_| "web".to_string());
+    let serve_web = ServeDir::new(&web_dir)
+        .append_index_html_on_directories(true)
+        .fallback(tower_http::services::ServeFile::new(
+            std::path::Path::new(&web_dir).join("index.html"),
+        ));
+
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .fallback_service(serve_web)
         .layer(cors)
         .layer(axum::Extension(config.jwt_secret.clone()))
         .with_state(state);

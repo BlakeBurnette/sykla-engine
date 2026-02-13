@@ -153,8 +153,8 @@ pub fn build_selector_hud(
     width: f32,
     height: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
-    let mut verts = Vec::with_capacity(4096);
-    let mut indices = Vec::with_capacity(8192);
+    let mut verts = Vec::with_capacity(16384);
+    let mut indices = Vec::with_capacity(32768);
 
     let scale = (width / 1440.0).clamp(0.5, 2.0);
 
@@ -181,15 +181,32 @@ pub fn build_selector_hud(
 
     // Route list
     let list_top = title_y + title_size * 2.5;
-    let row_h = 28.0 * scale;
+    let row_h = 32.0 * scale;
     let name_size = 8.0 * scale;
     let desc_size = 5.0 * scale;
     let list_w = 500.0 * scale;
     let list_x = (width - list_w) * 0.5;
     let padding = 12.0 * scale;
 
-    for (i, &(name, desc)) in routes.iter().enumerate() {
-        let y = list_top + i as f32 * row_h;
+    // Scroll: compute how many rows fit and the scroll offset
+    let hint_y_reserved = 50.0 * scale;
+    let list_avail_h = height - list_top - hint_y_reserved;
+    let max_visible = (list_avail_h / row_h).floor() as usize;
+    let max_visible = max_visible.max(1);
+    let scroll_offset = if routes.len() <= max_visible {
+        0
+    } else if selected < max_visible / 2 {
+        0
+    } else if selected + max_visible / 2 >= routes.len() {
+        routes.len().saturating_sub(max_visible)
+    } else {
+        selected.saturating_sub(max_visible / 2)
+    };
+    let visible_end = (scroll_offset + max_visible).min(routes.len());
+
+    for i in scroll_offset..visible_end {
+        let (name, desc) = routes[i];
+        let y = list_top + (i - scroll_offset) as f32 * row_h;
         let is_selected = i == selected;
 
         // Row background (highlight for selected)
@@ -239,6 +256,30 @@ pub fn build_selector_hud(
             &desc_upper, list_x + padding, y + 4.0 * scale + name_size * 1.6,
             desc_size, desc_size * 1.4,
             dr, dg, db, 0.9,
+        );
+    }
+
+    // Scroll indicators
+    let indicator_size = 5.0 * scale;
+    if scroll_offset > 0 {
+        let arrow = "...";
+        let aw = text_width(arrow, indicator_size);
+        push_text(
+            &mut verts, &mut indices,
+            arrow, list_x + (list_w - aw) * 0.5, list_top - indicator_size * 1.8,
+            indicator_size, indicator_size * 1.4,
+            0.4, 0.4, 0.5, 0.6,
+        );
+    }
+    if visible_end < routes.len() {
+        let arrow = "...";
+        let aw = text_width(arrow, indicator_size);
+        let bottom_y = list_top + (visible_end - scroll_offset) as f32 * row_h;
+        push_text(
+            &mut verts, &mut indices,
+            arrow, list_x + (list_w - aw) * 0.5, bottom_y + 2.0 * scale,
+            indicator_size, indicator_size * 1.4,
+            0.4, 0.4, 0.5, 0.6,
         );
     }
 

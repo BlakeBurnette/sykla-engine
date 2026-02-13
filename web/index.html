@@ -56,6 +56,23 @@
             border-radius: 3px;
             font-size: 11px;
         }
+        #webgpu-error {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #2a1a2e;
+            color: #e8e8e8;
+            padding: 40px;
+            border-radius: 12px;
+            font-family: system-ui, sans-serif;
+            text-align: center;
+            max-width: 500px;
+            z-index: 200;
+        }
+        #webgpu-error h2 { color: #ff6b6b; margin-bottom: 16px; }
+        #webgpu-error p { line-height: 1.6; color: #ccc; }
     </style>
 </head>
 <body>
@@ -65,24 +82,30 @@
         <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / Arrows — Move &amp; Turn<br>
         <kbd>Space</kbd> / <kbd>Q</kbd> — Up &nbsp; <kbd>E</kbd> — Down<br>
         <kbd>T</kbd> — Look up &nbsp; <kbd>G</kbd> — Look down<br>
-        <kbd>Shift</kbd> — Sprint &nbsp; <kbd>R</kbd>/<kbd>F</kbd> — Speed ±
+        <kbd>Shift</kbd> — Sprint &nbsp; <kbd>R</kbd>/<kbd>F</kbd> — Speed ±<br>
+        <kbd>Tab</kbd> — Toggle Road/Free-Roam &nbsp; <kbd>Esc</kbd> — Back
+    </div>
+    <div id="webgpu-error">
+        <h2>WebGPU Not Available</h2>
+        <p>Sykla requires WebGPU, which is supported in Chrome 113+, Edge 113+, and recent Firefox/Safari versions.</p>
+        <p style="margin-top: 12px">Please try a recent version of Chrome or Edge.</p>
     </div>
     <canvas id="sykla-canvas"></canvas>
 
     <script src="ble.js"></script>
     <script type="module">
-        import init from './dist/sykla_web.js';
-        init().then(() => {
+        // Check for WebGPU support before loading WASM
+        if (!navigator.gpu) {
+            document.getElementById('webgpu-error').style.display = 'block';
             document.getElementById('status').textContent = '';
-        }).catch(err => {
-            // Bevy uses exceptions for control flow in WASM — not a real error
-            const msg = String(err);
-            if (msg.includes('Using exceptions for control flow')) {
+        } else {
+            import('./dist/sykla_web.js').then(m => m.default()).then(() => {
                 document.getElementById('status').textContent = '';
-            } else {
+            }).catch(err => {
+                console.error('WASM init error:', err);
                 document.getElementById('status').textContent = 'Error: ' + err;
-            }
-        });
+            });
+        }
     </script>
 </body>
 </html>

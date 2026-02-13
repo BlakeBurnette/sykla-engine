@@ -3,8 +3,14 @@ use crate::vegetation::VegetationConfig;
 
 /// Visual style parameters that control how the world looks for a given route.
 pub struct RouteStyle {
-    /// Terrain mesh color [r, g, b, a]
+    /// Terrain mesh color [r, g, b, a] — low elevation / base zone
     pub terrain_color: [f32; 4],
+    /// Mid elevation terrain color (rocky grey for alpine)
+    pub terrain_mid_color: [f32; 4],
+    /// High elevation terrain color (snow white for alpine)
+    pub terrain_high_color: [f32; 4],
+    /// Elevation zone transition bands [low_start, low_end, high_start, high_end]
+    pub elevation_zones: [f32; 4],
     /// Ground plane color [r, g, b, a]
     pub ground_color: [f32; 4],
     /// Road surface color [r, g, b, a]
@@ -21,6 +27,10 @@ pub struct RouteStyle {
     pub bush_color: [f32; 4],
     /// Vegetation density config
     pub vegetation: VegetationConfig,
+    /// Fog / atmospheric haze color
+    pub fog_color: [f32; 3],
+    /// Sky clear color
+    pub sky_color: [f32; 3],
 }
 
 impl RouteStyle {
@@ -28,6 +38,9 @@ impl RouteStyle {
     fn forest() -> Self {
         Self {
             terrain_color: [0.32, 0.52, 0.15, 1.0],
+            terrain_mid_color: [0.32, 0.52, 0.15, 1.0],
+            terrain_high_color: [0.32, 0.52, 0.15, 1.0],
+            elevation_zones: [99999.0; 4],
             ground_color: [0.25, 0.40, 0.12, 1.0],
             road_color: [0.35, 0.30, 0.22, 1.0],
             gravel_color: [0.35, 0.30, 0.22, 1.0],
@@ -36,13 +49,18 @@ impl RouteStyle {
             pine_color: [0.06, 0.22, 0.04, 1.0],
             bush_color: [0.14, 0.35, 0.08, 1.0],
             vegetation: VegetationConfig::default(),
+            fog_color: [0.72, 0.68, 0.52],
+            sky_color: [0.52, 0.70, 0.82],
         }
     }
 
-    /// High alpine — rocky grey terrain, sparse stunted trees, dark asphalt road
+    /// High alpine — green meadow base → rocky grey mid → snow white summit
     fn alpine() -> Self {
         Self {
-            terrain_color: [0.45, 0.42, 0.38, 1.0],
+            terrain_color: [0.35, 0.55, 0.20, 1.0],       // Lush green meadow
+            terrain_mid_color: [0.45, 0.42, 0.38, 1.0],    // Rocky grey-brown
+            terrain_high_color: [0.88, 0.90, 0.95, 1.0],   // Blue-white snow
+            elevation_zones: [1700.0, 1900.0, 2000.0, 2200.0],
             ground_color: [0.35, 0.32, 0.28, 1.0],
             road_color: [0.18, 0.18, 0.20, 1.0],
             gravel_color: [0.18, 0.18, 0.20, 1.0],
@@ -51,13 +69,16 @@ impl RouteStyle {
             pine_color: [0.10, 0.20, 0.08, 1.0],
             bush_color: [0.20, 0.28, 0.12, 1.0],
             vegetation: VegetationConfig {
-                spacing_m: 12.0,
-                min_distance: 6.0,
+                spacing_m: 6.0,
+                min_distance: 4.0,
                 max_distance: 60.0,
-                trees_per_slot: 2,
+                trees_per_slot: 4,
                 min_scale: 0.3,
                 max_scale: 0.7,
+                treeline: 1900.0,
             },
+            fog_color: [0.78, 0.82, 0.90],
+            sky_color: [0.55, 0.72, 0.88],
         }
     }
 
@@ -65,6 +86,9 @@ impl RouteStyle {
     fn barren() -> Self {
         Self {
             terrain_color: [0.65, 0.62, 0.58, 1.0],
+            terrain_mid_color: [0.65, 0.62, 0.58, 1.0],
+            terrain_high_color: [0.65, 0.62, 0.58, 1.0],
+            elevation_zones: [99999.0; 4],
             ground_color: [0.55, 0.52, 0.48, 1.0],
             road_color: [0.20, 0.20, 0.22, 1.0],
             gravel_color: [0.20, 0.20, 0.22, 1.0],
@@ -79,7 +103,10 @@ impl RouteStyle {
                 trees_per_slot: 1,
                 min_scale: 0.2,
                 max_scale: 0.5,
+                ..Default::default()
             },
+            fog_color: [0.72, 0.68, 0.52],
+            sky_color: [0.52, 0.70, 0.82],
         }
     }
 
@@ -87,6 +114,9 @@ impl RouteStyle {
     fn coastal() -> Self {
         Self {
             terrain_color: [0.45, 0.50, 0.28, 1.0],
+            terrain_mid_color: [0.45, 0.50, 0.28, 1.0],
+            terrain_high_color: [0.45, 0.50, 0.28, 1.0],
+            elevation_zones: [99999.0; 4],
             ground_color: [0.50, 0.48, 0.35, 1.0],
             road_color: [0.32, 0.32, 0.30, 1.0],
             gravel_color: [0.32, 0.32, 0.30, 1.0],
@@ -101,7 +131,10 @@ impl RouteStyle {
                 trees_per_slot: 3,
                 min_scale: 0.5,
                 max_scale: 0.9,
+                ..Default::default()
             },
+            fog_color: [0.72, 0.68, 0.52],
+            sky_color: [0.52, 0.70, 0.82],
         }
     }
 
@@ -109,6 +142,9 @@ impl RouteStyle {
     fn greenway() -> Self {
         Self {
             terrain_color: [0.30, 0.48, 0.18, 1.0],
+            terrain_mid_color: [0.30, 0.48, 0.18, 1.0],
+            terrain_high_color: [0.30, 0.48, 0.18, 1.0],
+            elevation_zones: [99999.0; 4],
             ground_color: [0.28, 0.42, 0.15, 1.0],
             road_color: [0.88, 0.85, 0.80, 1.0],
             gravel_color: [0.72, 0.60, 0.42, 1.0],
@@ -123,7 +159,10 @@ impl RouteStyle {
                 trees_per_slot: 4,
                 min_scale: 0.8,
                 max_scale: 1.2,
+                ..Default::default()
             },
+            fog_color: [0.72, 0.68, 0.52],
+            sky_color: [0.52, 0.70, 0.82],
         }
     }
 }
@@ -181,6 +220,11 @@ pub fn catalog() -> Vec<RouteInfo> {
             key: "pacific-coast",
             description: "25 km coastal road, max 5%",
         },
+        RouteInfo {
+            name: "Col de la Loze",
+            key: "col-de-la-loze",
+            description: "15 km, avg 6%, summit 2299m (TdF 2025)",
+        },
     ]
 }
 
@@ -196,6 +240,7 @@ pub fn route_style(key: &str) -> RouteStyle {
         "stelvio" => RouteStyle::alpine(),
         "blue-ridge" => RouteStyle::forest(),
         "pacific-coast" => RouteStyle::coastal(),
+        "col-de-la-loze" => RouteStyle::alpine(),
         _ => RouteStyle::forest(),
     }
 }
@@ -225,6 +270,10 @@ pub fn generate_route(key: &str) -> Vec<RoutePoint> {
         "mont-ventoux" => generate_path(&MONT_VENTOUX, &MONT_VENTOUX_HEADINGS),
         "stelvio" => generate_path(&STELVIO, &STELVIO_HEADINGS),
         "pacific-coast" => generate_path(&PACIFIC_COAST, &PACIFIC_COAST_HEADINGS),
+        "col-de-la-loze" => {
+            let gpx = include_str!("../../../assets/routes/col-de-la-loze.gpx");
+            crate::gpx::generate_from_gpx(gpx, &COL_DE_LA_LOZE)
+        }
         _ => generate_demo(),
     };
 
@@ -611,4 +660,47 @@ static PACIFIC_COAST_HEADINGS: [(f64, f64); 14] = [
     (8000.0, 340.0), (10000.0, 320.0), (12000.0, 305.0), (14000.0, 325.0),
     (16000.0, 340.0), (18000.0, 315.0), (20000.0, 330.0), (22000.0, 310.0),
     (24000.0, 325.0), (25000.0, 320.0),
+];
+
+// ============================================================================
+// Col de la Loze — upper half, TdF 2025 Stage 18 summit finish
+// 15.1 km, 899m gain (1400m to 2299m), avg 6.0%
+// One of the highest and steepest summit finishes in Tour de France history.
+// Real GPS path from TdF 2025 race route above Méribel/Courchevel.
+// Brutal final ramps of 9.3% above 2100m, brief descent at ridge crossing.
+// ============================================================================
+
+static COL_DE_LA_LOZE: [(f64, f64); 32] = [
+    (0.0, 1400.0),       // Start: above Méribel
+    (500.0, 1420.0),
+    (1000.0, 1459.2),
+    (1500.0, 1494.9),
+    (2000.0, 1518.5),
+    (2500.0, 1556.0),
+    (3000.0, 1575.0),
+    (3500.0, 1592.9),
+    (4000.0, 1631.8),
+    (4500.0, 1670.4),
+    (5000.0, 1691.3),    // 5 km
+    (5500.0, 1724.7),
+    (6000.0, 1744.0),
+    (6500.0, 1764.8),
+    (7000.0, 1797.0),
+    (7500.0, 1827.8),
+    (8000.0, 1859.9),
+    (8500.0, 1880.4),
+    (9000.0, 1915.1),
+    (9500.0, 1940.0),
+    (10000.0, 1982.8),   // 10 km — approaching 2000m
+    (10500.0, 2034.4),
+    (11000.0, 2070.5),
+    (11500.0, 2048.0),   // Ridge dip — brief descent
+    (12000.0, 2063.7),
+    (12500.0, 2104.0),
+    (13000.0, 2135.6),
+    (13500.0, 2188.0),   // Steepening above 2100m
+    (14000.0, 2229.0),
+    (14500.0, 2242.0),
+    (15000.0, 2294.4),   // 15 km
+    (15058.8, 2299.0),   // Summit: Col de la Loze, 2299m
 ];

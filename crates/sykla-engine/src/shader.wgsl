@@ -12,10 +12,14 @@ struct LightUniform {
     direction: vec4<f32>,
     color: vec4<f32>,
     ambient: vec4<f32>,
+    fog_color: vec4<f32>,
 };
 
 struct MaterialUniform {
     base_color: vec4<f32>,
+    mid_color: vec4<f32>,
+    high_color: vec4<f32>,
+    zone_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -168,19 +172,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let V = normalize(camera.eye_pos.xyz - in.world_pos);
     let H = normalize(L + V);
 
+    // Elevation zone blending — smoothstep between base/mid/high colors
+    let t_low = smoothstep(material.zone_params.x, material.zone_params.y, in.world_pos.y);
+    let t_high = smoothstep(material.zone_params.z, material.zone_params.w, in.world_pos.y);
+    let zone_color = mix(mix(material.base_color.xyz, material.mid_color.xyz, t_low), material.high_color.xyz, t_high);
+
     // Noise-based color variation — multi-octave for natural look
     let n1 = fbm(in.world_pos.xz * 0.06);
     let n2 = noise2d(in.world_pos.xz * 0.3);
     let n3 = noise2d(in.world_pos.xz * 1.2); // fine detail
-    let color_var = material.base_color.xyz
+    let color_var = zone_color
         * (0.75 + 0.5 * n1)
         * (0.85 + 0.3 * n2)
         * (0.92 + 0.16 * n3);
 
     // Slope: dirt on steep areas, warm earth tones
+    // Reduce dirt blending in snow zones
     let slope = 1.0 - max(N.y, 0.0);
     let dirt = vec3<f32>(0.38, 0.28, 0.14);
-    let base_color = mix(color_var, dirt, clamp(slope * 2.5, 0.0, 0.5));
+    let dirt_strength = clamp(slope * 2.5, 0.0, 0.5) * (1.0 - t_high * 0.7);
+    let base_color = mix(color_var, dirt, dirt_strength);
 
     // Lighting
     let NdotL = dot(N, L);
@@ -189,9 +200,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let spec = pow(max(dot(N, H), 0.0), 64.0);
 
     // Subsurface-like translucency for foliage — warm glow when backlit
+    // Reduce above treeline (high zones are rock/snow, not foliage)
     let back_light = max(dot(-N, L), 0.0);
     let sss_color = vec3<f32>(0.45, 0.55, 0.1); // warm yellow-green glow
-    let sss = back_light * back_light * 0.35 * sss_color * base_color;
+    let sss_strength = 0.35 * (1.0 - t_high);
+    let sss = back_light * back_light * sss_strength * sss_color * base_color;
 
     // Shadow
     let shadow = shadow_factor_biased(in.shadow_pos, normalize(in.world_normal));
@@ -206,12 +219,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let direct = shadow * (diff * sun_warm * base_color + spec * sun_warm * 0.06);
     var color = ambient + direct + sss * shadow + bounce_color;
 
-    // Warm atmospheric haze — golden hour feel
+    // Atmospheric haze from fog uniform
     let dist = length(camera.eye_pos.xyz - in.world_pos);
     let height_factor = clamp((in.world_pos.y - 80.0) / 80.0, 0.0, 1.0);
     let fog_density = (1.0 - height_factor * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
-    let fog_color = vec3<f32>(0.72, 0.68, 0.52); // warm golden haze
-    color = mix(color, fog_color, fog_density * fog_density * 0.7);
+    color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
 
     // Subtle tone mapping to prevent blowout
     color = color / (color + vec3<f32>(1.0));
@@ -253,12 +265,11 @@ fn fs_road(in: VertexOutput) -> @location(0) vec4<f32> {
     let direct = shadow * (diff * sun * base_color + spec * sun * 0.04);
     var color = ambient + direct;
 
-    // Same atmospheric haze
+    // Same atmospheric haze from fog uniform
     let dist = length(camera.eye_pos.xyz - in.world_pos);
     let height_factor = clamp((in.world_pos.y - 80.0) / 80.0, 0.0, 1.0);
     let fog_density = (1.0 - height_factor * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
-    let fog_color = vec3<f32>(0.72, 0.68, 0.52);
-    color = mix(color, fog_color, fog_density * fog_density * 0.7);
+    color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
 
     // Tone mapping
     color = color / (color + vec3<f32>(1.0));
@@ -294,6 +305,57 @@ fn vs_shadow_animated(in: VertexInput, inst: AnimInstanceInput) -> @builtin(posi
     local.y += sin(time * 6.0 + inst.anim_phase) * 0.15 * abs(in.position.x) * inst.anim_scale;
 
     let wp = local * inst.anim_scale + inst.anim_pos;
+    return camera.light_vp * vec4<f32>(wp, 1.0);
+}
+
+// ── Cyclist instance vertex shaders ──────────────────────────────
+
+struct CyclistInstanceInput {
+    @location(3) pos: vec3<f32>,
+    @location(4) scale: f32,
+    @location(5) forward: vec2<f32>,
+    @location(6) pedal_phase: f32,
+    @location(7) pad: f32,
+};
+
+@vertex
+fn vs_cyclist(in: VertexInput, inst: CyclistInstanceInput) -> VertexOutput {
+    var out: VertexOutput;
+
+    // Y-axis rotation to face direction of travel
+    // Mesh faces +Z, forward = (fx, fz) in XZ plane
+    let cos_a = inst.forward.y;  // fz
+    let sin_a = inst.forward.x;  // fx
+
+    // Rotate position
+    let rx = in.position.x * cos_a + in.position.z * sin_a;
+    let ry = in.position.y;
+    let rz = -in.position.x * sin_a + in.position.z * cos_a;
+
+    // Rotate normal
+    let rnx = in.normal.x * cos_a + in.normal.z * sin_a;
+    let rny = in.normal.y;
+    let rnz = -in.normal.x * sin_a + in.normal.z * cos_a;
+
+    let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
+    out.clip_position = camera.view_proj * vec4<f32>(wp, 1.0);
+    out.world_pos = wp;
+    out.world_normal = vec3<f32>(rnx, rny, rnz);
+    out.uv = in.uv;
+    out.shadow_pos = world_to_shadow(wp);
+    return out;
+}
+
+@vertex
+fn vs_shadow_cyclist(in: VertexInput, inst: CyclistInstanceInput) -> @builtin(position) vec4<f32> {
+    let cos_a = inst.forward.y;
+    let sin_a = inst.forward.x;
+
+    let rx = in.position.x * cos_a + in.position.z * sin_a;
+    let ry = in.position.y;
+    let rz = -in.position.x * sin_a + in.position.z * cos_a;
+
+    let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
     return camera.light_vp * vec4<f32>(wp, 1.0);
 }
 
@@ -355,12 +417,11 @@ fn fs_water(in: VertexOutput) -> @location(0) vec4<f32> {
     let direct = shadow * (NdotL * light.color.xyz * reflected + spec * light.color.xyz * 0.8);
     var color = ambient + direct;
 
-    // Same fog as fs_main
+    // Same fog as fs_main — from uniform
     let dist = length(camera.eye_pos.xyz - in.world_pos);
     let height_factor = clamp((in.world_pos.y - 80.0) / 80.0, 0.0, 1.0);
     let fog_density = (1.0 - height_factor * 0.4) * clamp(dist / 1400.0, 0.0, 1.0);
-    let fog_color = vec3<f32>(0.72, 0.68, 0.52);
-    color = mix(color, fog_color, fog_density * fog_density * 0.7);
+    color = mix(color, light.fog_color.xyz, fog_density * fog_density * 0.7);
 
     // Tone mapping
     color = color / (color + vec3<f32>(1.0));

@@ -1,0 +1,16 @@
+target/
+**/target
+*.sykla
+web/dist/
+.git/
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+.credentials
+.DS_Store
+apps/
+godot/
+scripts/
+*.md

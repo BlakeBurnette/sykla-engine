@@ -5,6 +5,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraUniform};
+use crate::cyclist::CyclistInstanceData;
 use crate::mesh::{GpuMesh, Vertex};
 use crate::vegetation::InstanceData;
 use crate::wildlife::AnimatedInstanceData;
@@ -17,12 +18,16 @@ pub struct LightUniform {
     pub direction: [f32; 4],
     pub color: [f32; 4],
     pub ambient: [f32; 4],
+    pub fog_color: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MaterialUniform {
     pub base_color: [f32; 4],
+    pub mid_color: [f32; 4],
+    pub high_color: [f32; 4],
+    pub zone_params: [f32; 4],
 }
 
 pub struct DrawCall {
@@ -44,6 +49,13 @@ pub struct AnimatedDrawCall {
     pub material_bind_group: wgpu::BindGroup,
 }
 
+pub struct CyclistDrawCall {
+    pub mesh: GpuMesh,
+    pub instance_buffer: wgpu::Buffer,
+    pub instance_count: u32,
+    pub material_bind_group: wgpu::BindGroup,
+}
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -54,17 +66,20 @@ pub struct Renderer {
     pipeline_road: wgpu::RenderPipeline,
     pipeline_instanced: wgpu::RenderPipeline,
     pipeline_animated: wgpu::RenderPipeline,
+    pipeline_cyclist: wgpu::RenderPipeline,
     pipeline_water: wgpu::RenderPipeline,
     // Shadow pass pipelines
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_pipeline_instanced: wgpu::RenderPipeline,
     shadow_pipeline_animated: wgpu::RenderPipeline,
+    shadow_pipeline_cyclist: wgpu::RenderPipeline,
     // Bind groups and buffers
     camera_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     shadow_bind_group: wgpu::BindGroup,
     shadow_depth_view: wgpu::TextureView,
     material_bgl: wgpu::BindGroupLayout,
+    light_buffer: wgpu::Buffer,
     depth_view: wgpu::TextureView,
     pub light_dir: Vec3,
     pub width: u32,
@@ -88,8 +103,8 @@ fn hud_ortho_uniform(w: f32, h: f32) -> CameraUniform {
     }
 }
 
-const HUD_MAX_VERTS: usize = 4096;
-const HUD_MAX_INDICES: usize = 8192;
+const HUD_MAX_VERTS: usize = 32768;
+const HUD_MAX_INDICES: usize = 65536;
 
 impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>) -> Self {
@@ -97,8 +112,13 @@ impl Renderer {
         let width = size.width.max(1);
         let height = size.height.max(1);
 
+        let backends = if cfg!(target_arch = "wasm32") {
+            wgpu::Backends::BROWSER_WEBGPU
+        } else {
+            wgpu::Backends::all()
+        };
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..Default::default()
         });
 
@@ -113,12 +133,18 @@ impl Renderer {
             .await
             .expect("No suitable GPU adapter found");
 
+        let required_limits = if cfg!(target_arch = "wasm32") {
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+        } else {
+            wgpu::Limits::default()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("sykla_device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits,
                     memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,
@@ -158,6 +184,7 @@ impl Renderer {
             direction: [light_dir.x, light_dir.y, light_dir.z, 0.0],
             color: [1.0, 0.88, 0.65, 1.0],
             ambient: [0.35, 0.32, 0.22, 1.0],
+            fog_color: [0.72, 0.68, 0.52, 1.0],
         };
 
         // Uniform buffers
@@ -169,7 +196,7 @@ impl Renderer {
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("light_buffer"),
             contents: bytemuck::bytes_of(&light),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         // --- Bind group layouts ---
@@ -506,6 +533,52 @@ impl Renderer {
                 },
                 fragment: None,
                 primitive: animated_primitive,
+                depth_stencil: Some(shadow_depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Cyclist instance pipeline (pedal animation in vs_cyclist)
+        let pipeline_cyclist =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("cyclist_pipeline"),
+                layout: Some(&main_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_cyclist"),
+                    buffers: &[Vertex::layout(), CyclistInstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive,
+                depth_stencil: Some(depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        let shadow_pipeline_cyclist =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_cyclist_pipeline"),
+                layout: Some(&shadow_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_shadow_cyclist"),
+                    buffers: &[Vertex::layout(), CyclistInstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive,
                 depth_stencil: Some(shadow_depth_stencil),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
@@ -614,6 +687,9 @@ impl Renderer {
         // HUD dummy material bind group
         let hud_mat_uniform = MaterialUniform {
             base_color: [1.0, 1.0, 1.0, 1.0],
+            mid_color: [1.0, 1.0, 1.0, 1.0],
+            high_color: [1.0, 1.0, 1.0, 1.0],
+            zone_params: [99999.0; 4],
         };
         let hud_mat_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("hud_material_buffer"),
@@ -654,15 +730,18 @@ impl Renderer {
             pipeline_road,
             pipeline_instanced,
             pipeline_animated,
+            pipeline_cyclist,
             pipeline_water,
             shadow_pipeline,
             shadow_pipeline_instanced,
             shadow_pipeline_animated,
+            shadow_pipeline_cyclist,
             camera_bind_group,
             camera_buffer,
             shadow_bind_group,
             shadow_depth_view,
             material_bgl,
+            light_buffer,
             depth_view,
             light_dir,
             width,
@@ -695,7 +774,12 @@ impl Renderer {
     }
 
     pub fn create_material(&self, color: [f32; 4]) -> wgpu::BindGroup {
-        let uniform = MaterialUniform { base_color: color };
+        let uniform = MaterialUniform {
+            base_color: color,
+            mid_color: color,
+            high_color: color,
+            zone_params: [99999.0; 4],
+        };
         let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material_buffer"),
             contents: bytemuck::bytes_of(&uniform),
@@ -709,6 +793,40 @@ impl Renderer {
                 resource: buffer.as_entire_binding(),
             }],
         })
+    }
+
+    pub fn create_terrain_material(
+        &self,
+        base: [f32; 4],
+        mid: [f32; 4],
+        high: [f32; 4],
+        zones: [f32; 4],
+    ) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color: base,
+            mid_color: mid,
+            high_color: high,
+            zone_params: zones,
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain_material_bg"),
+            layout: &self.material_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    }
+
+    pub fn set_fog_color(&self, color: [f32; 3]) {
+        let offset = std::mem::offset_of!(LightUniform, fog_color) as u64;
+        let data: [f32; 4] = [color[0], color[1], color[2], 1.0];
+        self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&data));
     }
 
     pub fn create_instance_buffer(&self, instances: &[InstanceData]) -> wgpu::Buffer {
@@ -746,6 +864,23 @@ impl Renderer {
             })
     }
 
+    pub fn create_cyclist_instance_buffer(&self, instances: &[CyclistInstanceData]) -> wgpu::Buffer {
+        if instances.is_empty() {
+            return self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cyclist_instance_buffer_empty"),
+                size: std::mem::size_of::<CyclistInstanceData>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cyclist_instance_buffer"),
+                contents: bytemuck::cast_slice(instances),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            })
+    }
+
     pub fn update_hud(&mut self, vertices: &[Vertex], indices: &[u32]) {
         let vert_count = vertices.len().min(HUD_MAX_VERTS);
         let idx_count = indices.len().min(HUD_MAX_INDICES);
@@ -778,7 +913,9 @@ impl Renderer {
         road_draws: &[DrawCall],
         instanced_draws: &[InstancedDrawCall],
         animated_draws: &[AnimatedDrawCall],
+        cyclist_draws: &[CyclistDrawCall],
         water_draws: &[DrawCall],
+        sky_color: [f32; 3],
     ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -838,6 +975,17 @@ impl Renderer {
                 pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
             }
+
+            // Cyclist shadow draws
+            pass.set_pipeline(&self.shadow_pipeline_cyclist);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for call in cyclist_draws {
+                if call.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, call.instance_buffer.slice(..));
+                pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
+            }
         }
 
         // === Main pass ===
@@ -849,9 +997,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.52,
-                            g: 0.70,
-                            b: 0.82,
+                            r: sky_color[0] as f64,
+                            g: sky_color[1] as f64,
+                            b: sky_color[2] as f64,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -908,6 +1056,19 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.shadow_bind_group, &[]);
             for call in animated_draws {
+                if call.instance_count == 0 { continue; }
+                pass.set_bind_group(1, &call.material_bind_group, &[]);
+                pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, call.instance_buffer.slice(..));
+                pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
+            }
+
+            // Cyclist main draws
+            pass.set_pipeline(&self.pipeline_cyclist);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            for call in cyclist_draws {
                 if call.instance_count == 0 { continue; }
                 pass.set_bind_group(1, &call.material_bind_group, &[]);
                 pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));

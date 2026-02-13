@@ -4,30 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sykla-engine = { path = "../sykla-engine" }
 sykla-core = { path = "../sykla-core" }
 sykla-world = { path = "../sykla-world" }
-bevy = { version = "0.15", default-features = false, features = [
-    "bevy_asset",
-    "bevy_core_pipeline",
-    "bevy_pbr",
-    "bevy_render",
-    "bevy_scene",
-    "bevy_sprite",
-    "bevy_text",
-    "bevy_ui",
-    "bevy_winit",
-    "bevy_state",
-    "default_font",
-    "webgl2",
-    "png",
-] }
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+winit = "0.30"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "console",
     "Window",
     "Document",
+    "HtmlCanvasElement",
     "HtmlElement",
+    "Element",
     "Request",
     "RequestInit",
     "Response",
@@ -41,6 +32,8 @@ serde_json = { workspace = true }
 serde-wasm-bindgen = "0.6"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 bincode = "1"
+web-time = "1"
+log = "0.4"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

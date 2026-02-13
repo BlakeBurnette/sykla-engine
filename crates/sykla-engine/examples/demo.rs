@@ -6,7 +6,10 @@ use sykla_engine::glam::Vec3;
 use sykla_engine::hud::{build_hud, build_selector_hud};
 use sykla_engine::mesh::GpuMesh;
 use sykla_engine::physics::{PhysicsParams, PhysicsState, update_physics};
-use sykla_engine::renderer::{AnimatedDrawCall, DrawCall, InstancedDrawCall, Renderer};
+use sykla_engine::cyclist::{
+    CyclistInstanceData, NpcCyclist, generate_cyclist, spawn_npc_cyclists, update_cyclists,
+};
+use sykla_engine::renderer::{AnimatedDrawCall, CyclistDrawCall, DrawCall, InstancedDrawCall, Renderer};
 use sykla_engine::road::{generate_roads_by_surface, RoadConfig};
 use sykla_engine::routes;
 use sykla_engine::terrain::{generate_ground_plane, generate_terrain, interpolate_point, RoutePoint, SurfaceType, TerrainConfig};
@@ -26,6 +29,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+#[derive(Clone, Copy, PartialEq)]
+enum CameraMode {
+    ThirdPersonClose, // default — tight over-shoulder
+    ThirdPersonFar,   // wide cinematic view
+    FirstPerson,      // rider's eye level
+    LookBehind,       // reverse camera, see behind
+}
+
 #[derive(PartialEq)]
 enum AppState {
     Selecting,
@@ -42,8 +53,11 @@ struct App {
     instanced_draws: Vec<InstancedDrawCall>,
     animated_draws: Vec<AnimatedDrawCall>,
     water_draws: Vec<DrawCall>,
+    cyclist_draws: Vec<CyclistDrawCall>,
     // CPU copies for per-frame position updates
     flying_cpu: Vec<Vec<AnimatedInstanceData>>,
+    cyclist_cpu: Vec<CyclistInstanceData>,
+    npc_cyclists: Vec<NpcCyclist>,
     start_time: Instant,
     prev_t: f32,
     route_length: f32,
@@ -52,6 +66,8 @@ struct App {
     physics_params: PhysicsParams,
     current_route: usize,
     current_key: &'static str,
+    camera_mode: CameraMode,
+    sky_color: [f32; 3],
 }
 
 impl App {
@@ -66,7 +82,10 @@ impl App {
             instanced_draws: Vec::new(),
             animated_draws: Vec::new(),
             water_draws: Vec::new(),
+            cyclist_draws: Vec::new(),
             flying_cpu: Vec::new(),
+            cyclist_cpu: Vec::new(),
+            npc_cyclists: Vec::new(),
             start_time: Instant::now(),
             prev_t: 0.0,
             route_length: 0.0,
@@ -75,6 +94,8 @@ impl App {
             physics_params: PhysicsParams::default(),
             current_route: 0,
             current_key: "att",
+            camera_mode: CameraMode::ThirdPersonClose,
+            sky_color: [0.52, 0.70, 0.82],
         }
     }
 
@@ -105,8 +126,17 @@ impl App {
         let terrain_gpu = GpuMesh::from_cpu(&renderer.device, &terrain_mesh);
         let ground_gpu = GpuMesh::from_cpu(&renderer.device, &ground_mesh);
 
-        let terrain_mat = renderer.create_material(style.terrain_color);
+        let terrain_mat = renderer.create_terrain_material(
+            style.terrain_color,
+            style.terrain_mid_color,
+            style.terrain_high_color,
+            style.elevation_zones,
+        );
         let ground_mat = renderer.create_material(style.ground_color);
+
+        // Set fog and sky from route style
+        renderer.set_fog_color(style.fog_color);
+        self.sky_color = style.sky_color;
 
         self.draws = vec![
             DrawCall {
@@ -420,6 +450,30 @@ impl App {
             self.flying_cpu[3].len(),
             total_flying,
         );
+
+        // --- Cyclists ---
+        self.npc_cyclists = spawn_npc_cyclists(self.route_length, 20);
+        let cyclist_mesh_cpu = generate_cyclist();
+        let cyclist_gpu = GpuMesh::from_cpu(&renderer.device, &cyclist_mesh_cpu);
+        let cyclist_mat = renderer.create_material([0.15, 0.30, 0.65, 1.0]); // blue jersey
+
+        self.cyclist_cpu = update_cyclists(
+            &mut self.npc_cyclists,
+            &self.route_points,
+            self.route_length,
+            0.0,
+        );
+        let cyclist_buf = renderer.create_cyclist_instance_buffer(&self.cyclist_cpu);
+        let cyclist_count = self.cyclist_cpu.len() as u32;
+
+        self.cyclist_draws = vec![CyclistDrawCall {
+            mesh: cyclist_gpu,
+            instance_buffer: cyclist_buf,
+            instance_count: cyclist_count,
+            material_bind_group: cyclist_mat,
+        }];
+
+        log::info!("Cyclists: {} NPCs", cyclist_count);
     }
 
     fn route_name(&self) -> &'static str {
@@ -432,6 +486,7 @@ impl App {
         self.build_world();
         self.start_time = Instant::now();
         self.prev_t = 0.0;
+        self.camera_mode = CameraMode::ThirdPersonClose;
         self.state = AppState::Riding;
     }
 }
@@ -493,6 +548,14 @@ impl ApplicationHandler for App {
                                 PhysicalKey::Code(KeyCode::Escape) => {
                                     self.state = AppState::Selecting;
                                 }
+                                PhysicalKey::Code(KeyCode::KeyC) => {
+                                    self.camera_mode = match self.camera_mode {
+                                        CameraMode::ThirdPersonClose => CameraMode::ThirdPersonFar,
+                                        CameraMode::ThirdPersonFar => CameraMode::FirstPerson,
+                                        CameraMode::FirstPerson => CameraMode::LookBehind,
+                                        CameraMode::LookBehind => CameraMode::ThirdPersonClose,
+                                    };
+                                }
                                 _ => {}
                             }
                         }
@@ -541,7 +604,7 @@ impl App {
         let renderer = self.renderer.as_mut().unwrap();
         renderer.update_hud(&hud_verts, &hud_indices);
 
-        match renderer.render(&[], &[], &[], &[], &[]) {
+        match renderer.render(&[], &[], &[], &[], &[], &[], self.sky_color) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
                 let (w, h) = (renderer.width, renderer.height);
@@ -569,21 +632,30 @@ impl App {
         // Camera follows curved route using physics distance
         let dist = self.physics_state.distance;
         let (px, pz, elev_here, fx, fz) = interpolate_point(&self.route_points, dist as f64);
-        let (ax, az, elev_ahead, _, _) = interpolate_point(&self.route_points, (dist + 50.0) as f64);
-        let elev_max = elev_here.max(elev_ahead);
 
         // Perpendicular direction for camera offset
         let perp_x = -fz;
         let perp_z = fx;
 
-        // Camera: 2m left, 5.5m up, 8m behind
+        // Mode-dependent camera parameters
+        let (behind, up, lateral, look_ahead, fov) = match self.camera_mode {
+            CameraMode::ThirdPersonClose => (3.0_f32, 2.5_f32, -0.5_f32, 15.0_f32, 60.0_f32),
+            CameraMode::ThirdPersonFar   => (8.0, 5.5, -2.0, 50.0, 60.0),
+            CameraMode::FirstPerson      => (0.0, 1.7, 0.0, 20.0, 75.0),
+            CameraMode::LookBehind       => (-5.0, 2.5, -0.5, -20.0, 60.0),
+        };
+
+        self.camera.fov_y = fov.to_radians();
+
         self.camera.eye = Vec3::new(
-            px + perp_x * (-2.0) - fx * 8.0,
-            elev_here + 5.5,
-            pz + perp_z * (-2.0) - fz * 8.0,
+            px + perp_x * lateral - fx * behind,
+            elev_here + up,
+            pz + perp_z * lateral - fz * behind,
         );
-        // Look 50m ahead along the road
-        self.camera.target = Vec3::new(ax, elev_max + 2.0, az);
+
+        let (ax, az, elev_ahead, _, _) = interpolate_point(&self.route_points, (dist + look_ahead) as f64);
+        let target_elev = elev_here.max(elev_ahead) + 2.0;
+        self.camera.target = Vec3::new(ax, target_elev, az);
 
         // Immutable renderer reference for camera/flying updates
         let renderer = match &self.renderer {
@@ -619,6 +691,21 @@ impl App {
             );
         }
 
+        // Update cyclist positions (CPU → GPU)
+        self.cyclist_cpu = update_cyclists(
+            &mut self.npc_cyclists,
+            &self.route_points,
+            self.route_length,
+            dt,
+        );
+        if !self.cyclist_cpu.is_empty() && !self.cyclist_draws.is_empty() {
+            renderer.queue.write_buffer(
+                &self.cyclist_draws[0].instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.cyclist_cpu),
+            );
+        }
+
         // Mutable renderer reference for HUD update + render
         let renderer = self.renderer.as_mut().unwrap();
         renderer.update_hud(&hud_verts, &hud_indices);
@@ -628,7 +715,9 @@ impl App {
             &self.road_draws,
             &self.instanced_draws,
             &self.animated_draws,
+            &self.cyclist_draws,
             &self.water_draws,
+            self.sky_color,
         ) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
