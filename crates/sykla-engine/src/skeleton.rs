@@ -127,9 +127,11 @@ impl SkeletonSystem {
         let count = cyclist_data.len().min(self.gpu_matrices.len() / NUM_BONES);
         for i in 0..count {
             let phase = cyclist_data[i].pedal_phase;
+            let lean = cyclist_data[i].lean_angle;
             let offset = i * NUM_BONES;
             compute_skin_matrices(
                 phase,
+                lean,
                 &self.def,
                 &mut self.gpu_matrices[offset..offset + NUM_BONES],
             );
@@ -143,6 +145,7 @@ impl SkeletonSystem {
 /// This transforms vertices from bind pose (A-pose) to animated (riding) pose.
 fn compute_skin_matrices(
     pedal_phase: f32,
+    lean_angle: f32,
     def: &SkeletonDef,
     out: &mut [[[f32; 4]; 4]],
 ) {
@@ -152,7 +155,10 @@ fn compute_skin_matrices(
     // All lean is on the hips bone so that Pelvis-weighted AND spine-weighted
     // vertices lean together (single-bone skinning — no blend weights).
     let hip_lean = 1.05; // ~60° forward lean — aggressive hoods position (long reach frame)
-    animated_world[HIPS] = Mat4::from_translation(RIDING_HIP) * rotation_x(hip_lean);
+    // Extra lateral lean: rider upper body leans 15% more into turn than the bike
+    animated_world[HIPS] = Mat4::from_translation(RIDING_HIP)
+        * rotation_x(hip_lean)
+        * rotation_z(lean_angle * 0.15);
 
     // --- Spine chain: follows hips, no additional rotation ---
     // (All lean is already on hips to avoid tearing between Pelvis/spine vertex groups)
@@ -172,13 +178,14 @@ fn compute_skin_matrices(
         animated_world[SPINE2] = parent_world * Mat4::from_translation(local_offset);
     }
 
-    // --- Neck: compensate upward so head looks at road ---
+    // --- Neck: compensate upward so head looks at road, turn into corner ---
     {
         let parent_world = animated_world[SPINE2];
         let local_offset = BIND_POS[NECK] - BIND_POS[SPINE2];
         animated_world[NECK] = parent_world
             * Mat4::from_translation(local_offset)
-            * rotation_x(-0.75);
+            * rotation_x(-0.75)
+            * rotation_y(lean_angle * 0.5); // ~15° head turn at 30° lean
     }
 
     // --- Head: follows neck ---
@@ -202,17 +209,34 @@ fn compute_skin_matrices(
         GRIP_R,
     );
 
+    // --- Pedal coasting in sharp corners ---
+    // When lean > ~20°, blend pedal phase toward outside-pedal-down position
+    let coast_blend = smoothstep(0.30, 0.40, lean_angle.abs());
+    let coast_phase = if lean_angle > 0.0 { PI } else { 0.0 };
+    let effective_phase = if coast_blend > 0.001 {
+        // Shortest-arc blend to avoid leg sweep through the bike
+        let mut diff = coast_phase - pedal_phase;
+        if diff > PI { diff -= std::f32::consts::TAU; }
+        if diff < -PI { diff += std::f32::consts::TAU; }
+        pedal_phase + coast_blend * diff
+    } else {
+        pedal_phase
+    };
+
     // --- Legs: IK-driven from pedal positions ---
-    // Crank angle θ = pedal_phase, θ=0 = TDC (right pedal at top).
+    // Crank angle θ = effective_phase, θ=0 = TDC (right pedal at top).
     // Right leg at θ, left leg at θ+π (opposite).
-    compute_leg_ik(&mut animated_world, pedal_phase + PI, true);
-    compute_leg_ik(&mut animated_world, pedal_phase, false);
+    compute_leg_ik(&mut animated_world, effective_phase + PI, true);
+    compute_leg_ik(&mut animated_world, effective_phase, false);
 
     // --- Bike parts ---
     animated_world[BIKE_FRAME] = Mat4::from_translation(BIND_POS[BIKE_FRAME]);
     animated_world[CRANKSET] = Mat4::from_translation(BIND_POS[CRANKSET])
-        * rotation_x(pedal_phase);
-    animated_world[HANDLEBAR] = Mat4::from_translation(BIND_POS[HANDLEBAR]);
+        * rotation_x(effective_phase);
+    // Handlebar: slight counter-steer into corner
+    let steer_angle = lean_angle * 0.17; // ~5° per 30° lean
+    animated_world[HANDLEBAR] = Mat4::from_translation(BIND_POS[HANDLEBAR])
+        * rotation_y(steer_angle);
 
     // Reserved
     animated_world[23] = Mat4::IDENTITY;
@@ -376,6 +400,36 @@ fn two_bone_ik_3d(hip: Vec3, ankle: Vec3, thigh_len: f32, shin_len: f32, pole: V
     // Knee direction: rotate from hip→ankle axis toward pole by angle_a
     let knee_dir = forward * angle_a.cos() + pole_perp * angle_a.sin();
     hip + knee_dir * thigh_len
+}
+
+/// Smoothstep interpolation: 0 for x<=edge0, 1 for x>=edge1, smooth in between.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Rotation around Z axis (in XY plane).
+fn rotation_z(angle: f32) -> Mat4 {
+    let c = angle.cos();
+    let s = angle.sin();
+    Mat4::from_cols(
+        Vec4::new(c, s, 0.0, 0.0),
+        Vec4::new(-s, c, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 1.0, 0.0),
+        Vec4::new(0.0, 0.0, 0.0, 1.0),
+    )
+}
+
+/// Rotation around Y axis (in XZ plane).
+fn rotation_y(angle: f32) -> Mat4 {
+    let c = angle.cos();
+    let s = angle.sin();
+    Mat4::from_cols(
+        Vec4::new(c, 0.0, -s, 0.0),
+        Vec4::new(0.0, 1.0, 0.0, 0.0),
+        Vec4::new(s, 0.0, c, 0.0),
+        Vec4::new(0.0, 0.0, 0.0, 1.0),
+    )
 }
 
 /// Rotation around X axis (in YZ plane).

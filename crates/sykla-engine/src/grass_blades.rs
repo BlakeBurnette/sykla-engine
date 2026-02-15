@@ -124,8 +124,8 @@ impl GrassBladeConfig {
         Some(if biome_type < 1.5 {
             // Piedmont
             Self {
-                blade_height: 0.30,
-                blade_height_variation: 0.12,
+                blade_height: 0.45,
+                blade_height_variation: 0.20,
                 density: 0.88,
                 color_base: [0.18, 0.30, 0.08],
                 color_tip: [0.35, 0.52, 0.18],
@@ -138,8 +138,8 @@ impl GrassBladeConfig {
         } else if biome_type < 2.5 {
             // Alpine
             Self {
-                blade_height: 0.35,
-                blade_height_variation: 0.14,
+                blade_height: 0.50,
+                blade_height_variation: 0.22,
                 density: 0.80,
                 color_base: [0.16, 0.28, 0.06],
                 color_tip: [0.30, 0.48, 0.15],
@@ -152,8 +152,8 @@ impl GrassBladeConfig {
         } else if biome_type < 4.5 {
             // Coastal
             Self {
-                blade_height: 0.40,
-                blade_height_variation: 0.15,
+                blade_height: 0.55,
+                blade_height_variation: 0.25,
                 density: 0.85,
                 color_base: [0.22, 0.34, 0.10],
                 color_tip: [0.45, 0.58, 0.25],
@@ -166,8 +166,8 @@ impl GrassBladeConfig {
         } else {
             // Forest
             Self {
-                blade_height: 0.40,
-                blade_height_variation: 0.15,
+                blade_height: 0.50,
+                blade_height_variation: 0.20,
                 density: 0.90,
                 color_base: [0.14, 0.25, 0.06],
                 color_tip: [0.28, 0.45, 0.14],
@@ -253,12 +253,24 @@ pub fn generate_blade_instances(
             let h3 = blade_hash(world_x * 13.7, world_z * 5.3);
             let h4 = blade_hash(world_x * 19.1, world_z * 23.7);
 
+            // Blade type encoding via color_variation:
+            // 0.00-0.69: normal grass (70%)
+            // 0.70-0.84: weed — taller, darker green
+            // 0.85-0.94: dead/dry grass — straw yellow-brown
+            // 0.95-1.00: fallen leaf — flat, brown/red/yellow
+            let type_hash = blade_hash(world_x * 23.1, world_z * 37.7);
+            let color_variation = type_hash;
+
+            // Adjust height and lean based on blade type
+            let is_weed = type_hash >= 0.70 && type_hash < 0.85;
+            let is_leaf = type_hash >= 0.95;
+            let height_mult = if is_weed { 1.5 } else { 1.0 };
             let height =
-                config.blade_height + (h2 - 0.5) * 2.0 * config.blade_height_variation;
+                (config.blade_height + (h2 - 0.5) * 2.0 * config.blade_height_variation) * height_mult;
             let rotation_y = h3 * std::f32::consts::TAU;
-            let lean_angle = h4 * 0.25;
+            // Fallen leaves lie flat (high lean angle)
+            let lean_angle = if is_leaf { 1.2 } else { h4 * 0.25 };
             let lean_direction = h2 * std::f32::consts::TAU;
-            let color_variation = h3;
 
             blades.push(GrassBladeInstance {
                 position: [jittered_x, y, jittered_z],

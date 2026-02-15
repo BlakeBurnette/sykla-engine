@@ -34,6 +34,8 @@ pub struct RoutePoint {
     pub geo_x: f32,
     /// Original (pre-stitch) world Z for DEM sampling. Falls back to pos_z when not set.
     pub geo_z: f32,
+    /// Signed curvature (1/m). Positive = turning right, negative = turning left.
+    pub curvature: f32,
 }
 
 impl Default for RoutePoint {
@@ -49,6 +51,7 @@ impl Default for RoutePoint {
             banking: 0.0,
             geo_x: 0.0,
             geo_z: 0.0,
+            curvature: 0.0,
         }
     }
 }
@@ -64,6 +67,59 @@ pub fn surface_at(points: &[RoutePoint], distance: f64) -> SurfaceType {
         }
     }
     points.last().unwrap().surface
+}
+
+/// Compute signed curvature for each route point from consecutive forward vectors.
+/// Positive curvature = turning right, negative = turning left.
+pub fn compute_curvatures(points: &mut [RoutePoint]) {
+    if points.len() < 3 {
+        return;
+    }
+    for i in 1..points.len() - 1 {
+        let fx0 = points[i - 1].forward_x;
+        let fz0 = points[i - 1].forward_z;
+        let fx1 = points[i + 1].forward_x;
+        let fz1 = points[i + 1].forward_z;
+
+        let cross = fx0 * fz1 - fz0 * fx1;
+        let dot = fx0 * fx1 + fz0 * fz1;
+        let dtheta = cross.atan2(dot);
+
+        let ds = (points[i + 1].distance_m - points[i - 1].distance_m) as f32;
+        if ds.abs() > 0.01 {
+            points[i].curvature = dtheta / ds;
+        }
+    }
+    // Copy endpoints from neighbors
+    if points.len() >= 2 {
+        points[0].curvature = points[1].curvature;
+        let last = points.len() - 1;
+        points[last].curvature = points[last - 1].curvature;
+    }
+}
+
+/// Interpolate curvature at an arbitrary distance along the route.
+pub fn curvature_at(points: &[RoutePoint], dist: f64) -> f32 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    if dist <= points[0].distance_m {
+        return points[0].curvature;
+    }
+    for i in 1..points.len() {
+        if points[i].distance_m >= dist {
+            let prev = &points[i - 1];
+            let curr = &points[i];
+            let seg_len = curr.distance_m - prev.distance_m;
+            let t = if seg_len.abs() < 0.001 {
+                0.0
+            } else {
+                ((dist - prev.distance_m) / seg_len).clamp(0.0, 1.0) as f32
+            };
+            return prev.curvature + t * (curr.curvature - prev.curvature);
+        }
+    }
+    points.last().unwrap().curvature
 }
 
 /// Interpolate position, elevation, and forward direction at an arbitrary distance along the route.

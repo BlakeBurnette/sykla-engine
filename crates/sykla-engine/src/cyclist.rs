@@ -4,7 +4,8 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::gltf;
 use crate::mesh::CpuMesh;
-use crate::terrain::{RoutePoint, interpolate_point, offset_position};
+use crate::terrain::{RoutePoint, curvature_at, interpolate_point, offset_position};
+use crate::turnaround::RouteDirection;
 
 // ── Cyclist instance data (32 bytes, vertex locations 3-7) ─────
 
@@ -15,7 +16,7 @@ pub struct CyclistInstanceData {
     pub scale: f32,
     pub forward: [f32; 2],
     pub pedal_phase: f32,
-    pub _pad: f32,
+    pub lean_angle: f32,
 }
 
 impl CyclistInstanceData {
@@ -106,6 +107,8 @@ pub struct NpcCyclist {
     pub distance: f32,
     pub lateral_offset: f32,
     pub speed: f32,
+    pub lean_angle: f32,
+    pub direction: RouteDirection,
 }
 
 pub fn spawn_npc_cyclists(route_length: f32, count: usize) -> Vec<NpcCyclist> {
@@ -117,17 +120,38 @@ pub fn spawn_npc_cyclists(route_length: f32, count: usize) -> Vec<NpcCyclist> {
         let base_dist = i as f32 * spacing;
         let jitter = (next_rng(&mut rng) - 0.5) * spacing * 0.5;
         let distance = (base_dist + jitter).rem_euclid(route_length);
-        let lateral_offset = (next_rng(&mut rng) - 0.5) * 3.0;
         let speed = 6.0 + next_rng(&mut rng) * 4.0;
+
+        // ~30% of NPCs are oncoming (reverse direction)
+        let oncoming = next_rng(&mut rng) < 0.3;
+        let direction = if oncoming { RouteDirection::Reverse } else { RouteDirection::Forward };
+
+        // Forward NPCs ride in right lane (+offset), oncoming in left lane (-offset = their right)
+        let lane_spread = 0.8 + next_rng(&mut rng) * 1.2; // 0.8–2.0m from center
+        let lateral_offset = if oncoming { -lane_spread } else { lane_spread };
 
         npcs.push(NpcCyclist {
             distance,
             lateral_offset,
             speed,
+            lean_angle: 0.0,
+            direction,
         });
     }
 
     npcs
+}
+
+/// Compute target lean angle from speed and curvature.
+/// lean = atan(v² * κ / g), clamped to ~40°.
+pub fn target_lean(speed: f32, curvature: f32) -> f32 {
+    (speed * speed * curvature / 9.81).atan().clamp(-0.70, 0.70)
+}
+
+/// Exponential smoothing for lean angle (~0.25s time constant).
+pub fn smooth_lean(current: f32, target: f32, dt: f32) -> f32 {
+    let alpha = 1.0 - (-4.0 * dt).exp();
+    current + alpha * (target - current)
 }
 
 /// Road surface offset — the road mesh sits 0.08m above raw terrain elevation.
@@ -145,9 +169,30 @@ pub fn update_cyclists(
 
     npcs.iter_mut()
         .map(|npc| {
-            npc.distance = (npc.distance + npc.speed * dt) % route_length;
+            // Direction-aware movement
+            match npc.direction {
+                RouteDirection::Forward => {
+                    npc.distance = (npc.distance + npc.speed * dt) % route_length;
+                }
+                RouteDirection::Reverse => {
+                    npc.distance -= npc.speed * dt;
+                    if npc.distance < 0.0 {
+                        npc.distance += route_length;
+                    }
+                }
+            }
+
             let (px, pz, elev, fx, fz) = interpolate_point(route_points, npc.distance as f64);
             let (wx, wz) = offset_position(px, pz, fx, fz, npc.lateral_offset);
+
+            // Direction-aware forward vector and curvature
+            let (render_fx, render_fz, kappa) = match npc.direction {
+                RouteDirection::Forward => (fx, fz, curvature_at(route_points, npc.distance as f64)),
+                RouteDirection::Reverse => (-fx, -fz, -curvature_at(route_points, npc.distance as f64)),
+            };
+
+            let target = target_lean(npc.speed, kappa);
+            npc.lean_angle = smooth_lean(npc.lean_angle, target, dt);
 
             // Pedal phase from distance (~80 RPM at typical speeds)
             let pedal_phase = (npc.distance / 5.3) * TAU;
@@ -155,9 +200,9 @@ pub fn update_cyclists(
             CyclistInstanceData {
                 position: [wx, elev + ROAD_SURFACE_OFFSET, wz],
                 scale: 1.0,
-                forward: [fx, fz],
+                forward: [render_fx, render_fz],
                 pedal_phase,
-                _pad: 0.0,
+                lean_angle: npc.lean_angle,
             }
         })
         .collect()

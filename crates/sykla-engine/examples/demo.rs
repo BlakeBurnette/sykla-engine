@@ -1,8 +1,12 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use sykla_engine::audio::{AudioParams, AudioSurface, AudioSynth, Biome};
 use sykla_engine::camera::{Camera, CameraMode};
+use sykla_engine::post_process::PostProcessUniforms;
+use sykla_engine::sky::SkyState;
 use sykla_engine::dem::{DemTile, GeoOrigin};
+use sykla_engine::fpv_camera::CyclingCamera;
 use sykla_engine::glam::Vec3;
 use sykla_engine::hud::{build_hud, build_selector_hud, camera_button_rects};
 use sykla_engine::mesh::GpuMesh;
@@ -19,17 +23,17 @@ use sykla_engine::renderer::{AnimatedDrawCall, CyclistMeshPart, CyclistModel, Cy
 use sykla_engine::road::{generate_roads_by_surface, RoadConfig};
 use sykla_engine::routes::{self, RoadMarkings};
 use sykla_engine::structures;
-use sykla_engine::terrain::{generate_ground_plane, generate_terrain, interpolate_point, DemTerrainSource, RoutePoint, SurfaceType};
-use sykla_engine::vegetation::{
-    generate_bush, generate_canopy, generate_pine_canopy, generate_pine_trunk, generate_trunk,
-    place_vegetation,
-};
-use sykla_engine::treeline::{generate_billboard_quad, generate_treeline_strips, TreelineConfig};
+use sykla_engine::cyclist::{target_lean, smooth_lean};
+use sykla_engine::terrain::{generate_ground_plane, generate_terrain, interpolate_point, surface_at, DemTerrainSource, RoutePoint, SurfaceType};
+use sykla_engine::turnaround::RiderRouteState;
+use sykla_engine::vegetation::place_vegetation;
 use sykla_engine::water::{detect_water_features, generate_water_mesh};
 use sykla_engine::wildlife::{
     generate_bird, generate_deer, generate_egret, generate_goose, generate_small_bird,
-    generate_squirrel, generate_turtle, place_wildlife, AnimatedInstanceData,
+    generate_squirrel, generate_turkey, generate_turtle, place_wildlife, AnimatedInstanceData,
 };
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -75,11 +79,17 @@ struct App {
     geo_origin: Option<GeoOrigin>,
     physics_state: PhysicsState,
     physics_params: PhysicsParams,
+    player_lean_angle: f32,
+    rider_state: RiderRouteState,
     current_route: usize,
     current_key: &'static str,
     camera_mode: CameraMode,
+    fpv_camera: CyclingCamera,
     cursor_pos: (f32, f32),
-    sky_color: [f32; 3],
+    sky_state: SkyState,
+    post_process: PostProcessUniforms,
+    audio_shared: Option<Arc<Mutex<(AudioSynth, AudioParams)>>>,
+    _audio_stream: Option<cpal::Stream>,
 }
 
 impl App {
@@ -115,11 +125,17 @@ impl App {
             geo_origin: None,
             physics_state: PhysicsState::default(),
             physics_params: PhysicsParams::default(),
+            player_lean_angle: 0.0,
+            rider_state: RiderRouteState::new(&[]),
             current_route: 0,
             current_key: "att",
             camera_mode: CameraMode::ThirdPersonClose,
+            fpv_camera: CyclingCamera::new(),
             cursor_pos: (0.0, 0.0),
-            sky_color: [0.52, 0.70, 0.82],
+            sky_state: SkyState::new(10.0, 36.0),
+            post_process: PostProcessUniforms::default(),
+            audio_shared: None,
+            _audio_stream: None,
         }
     }
 
@@ -133,7 +149,8 @@ impl App {
         self.current_route = index;
         self.current_key = key;
         self.physics_state = PhysicsState::default();
-        log::info!("Loaded route: {} ({:.1} km)", cat[index].name, self.route_length / 1000.0);
+        self.rider_state = RiderRouteState::new(&self.route_points);
+        log::info!("Loaded route: {} ({:.1} km, {:?})", cat[index].name, self.route_length / 1000.0, self.rider_state.topology);
     }
 
     fn build_world(&mut self) {
@@ -201,7 +218,10 @@ impl App {
         renderer.set_light_color(style.light_color);
         renderer.set_light_ambient(style.light_ambient);
         renderer.set_fog_color(style.fog_color);
-        self.sky_color = style.sky_color;
+        // Update sky state latitude from geo_origin
+        if let Some(origin) = &self.geo_origin {
+            self.sky_state.latitude = origin.lat0 as f32;
+        }
 
         self.draws = vec![
             DrawCall {
@@ -246,7 +266,8 @@ impl App {
                 SurfaceType::Gravel => style.gravel_color,
             };
             let gpu = GpuMesh::from_cpu(&renderer.device, mesh);
-            let mat = renderer.create_road_material(color, has_markings);
+            let is_gravel = matches!(surface, SurfaceType::Gravel);
+            let mat = renderer.create_road_material(color, has_markings, is_gravel);
             self.road_draws.push(DrawCall {
                 mesh: gpu,
                 material_bind_group: mat,
@@ -344,144 +365,9 @@ impl App {
             terrain_config.half_width, terrain_config.falloff,
         );
 
-        // Shared meshes
-        let trunk_mesh = generate_trunk();
-        let canopy_mesh = generate_canopy();
-        let pine_trunk_mesh = generate_pine_trunk();
-        let pine_canopy_mesh = generate_pine_canopy();
-        let bush_mesh_cpu = generate_bush();
+        self.instanced_draws = Vec::new();
 
-        // GPU meshes — reuse same mesh for mature + young (scale does the rest)
-        let dec_trunk_gpu = GpuMesh::from_cpu(&renderer.device, &trunk_mesh);
-        let dec_canopy_gpu = GpuMesh::from_cpu(&renderer.device, &canopy_mesh);
-        let pine_trunk_gpu = GpuMesh::from_cpu(&renderer.device, &pine_trunk_mesh);
-        let pine_canopy_gpu = GpuMesh::from_cpu(&renderer.device, &pine_canopy_mesh);
-        let bush_gpu = GpuMesh::from_cpu(&renderer.device, &bush_mesh_cpu);
-
-        // Young growth reuses same mesh, separate instance buffers
-        let ydec_trunk_gpu = GpuMesh::from_cpu(&renderer.device, &trunk_mesh);
-        let ydec_canopy_gpu = GpuMesh::from_cpu(&renderer.device, &canopy_mesh);
-        let ypine_trunk_gpu = GpuMesh::from_cpu(&renderer.device, &pine_trunk_mesh);
-        let ypine_canopy_gpu = GpuMesh::from_cpu(&renderer.device, &pine_canopy_mesh);
-
-        // Instance buffers
-        let dec_buf1 = renderer.create_instance_buffer(&placement.deciduous);
-        let dec_buf2 = renderer.create_instance_buffer(&placement.deciduous);
-        let pine_buf1 = renderer.create_instance_buffer(&placement.pine);
-        let pine_buf2 = renderer.create_instance_buffer(&placement.pine);
-        let bush_buf = renderer.create_instance_buffer(&placement.bush);
-        let ydec_buf1 = renderer.create_instance_buffer(&placement.young_deciduous);
-        let ydec_buf2 = renderer.create_instance_buffer(&placement.young_deciduous);
-        let ypine_buf1 = renderer.create_instance_buffer(&placement.young_pine);
-        let ypine_buf2 = renderer.create_instance_buffer(&placement.young_pine);
-
-        let dec_count = placement.deciduous.len() as u32;
-        let pine_count = placement.pine.len() as u32;
-        let bush_count = placement.bush.len() as u32;
-        let ydec_count = placement.young_deciduous.len() as u32;
-        let ypine_count = placement.young_pine.len() as u32;
-
-        // Materials — derived from route style
-        let trunk_mat = renderer.create_material(style.trunk_color);
-        let dec_canopy_mat = renderer.create_material(style.canopy_color);
-        let pine_trunk_mat = renderer.create_material(style.trunk_color);
-        // Winter routes: snow on pine canopies (detected by elevation_zones[0] < 90000)
-        let is_winter = style.elevation_zones[0] < 90000.0;
-        let pine_canopy_mat = if is_winter {
-            renderer.create_snow_foliage_material(style.pine_color)
-        } else {
-            renderer.create_material(style.pine_color)
-        };
-        let bush_mat = renderer.create_material(style.bush_color);
-        // Young growth: slightly lighter variants
-        let young_trunk_mat = renderer.create_material([
-            style.trunk_color[0] + 0.04,
-            style.trunk_color[1] + 0.04,
-            style.trunk_color[2] + 0.02,
-            1.0,
-        ]);
-        let young_dec_canopy_mat = renderer.create_material([
-            style.canopy_color[0] + 0.05,
-            style.canopy_color[1] + 0.10,
-            style.canopy_color[2] + 0.03,
-            1.0,
-        ]);
-        let young_pine_color = [
-            style.pine_color[0] + 0.04,
-            style.pine_color[1] + 0.08,
-            style.pine_color[2] + 0.02,
-            1.0,
-        ];
-        let young_pine_canopy_mat = if is_winter {
-            renderer.create_snow_foliage_material(young_pine_color)
-        } else {
-            renderer.create_material(young_pine_color)
-        };
-
-        self.instanced_draws = vec![
-            InstancedDrawCall {
-                mesh: dec_trunk_gpu,
-                instance_buffer: dec_buf1,
-                instance_count: dec_count,
-                material_bind_group: trunk_mat.clone(),
-            },
-            InstancedDrawCall {
-                mesh: dec_canopy_gpu,
-                instance_buffer: dec_buf2,
-                instance_count: dec_count,
-                material_bind_group: dec_canopy_mat,
-            },
-            InstancedDrawCall {
-                mesh: pine_trunk_gpu,
-                instance_buffer: pine_buf1,
-                instance_count: pine_count,
-                material_bind_group: pine_trunk_mat.clone(),
-            },
-            InstancedDrawCall {
-                mesh: pine_canopy_gpu,
-                instance_buffer: pine_buf2,
-                instance_count: pine_count,
-                material_bind_group: pine_canopy_mat,
-            },
-            InstancedDrawCall {
-                mesh: bush_gpu,
-                instance_buffer: bush_buf,
-                instance_count: bush_count,
-                material_bind_group: bush_mat,
-            },
-            InstancedDrawCall {
-                mesh: ydec_trunk_gpu,
-                instance_buffer: ydec_buf1,
-                instance_count: ydec_count,
-                material_bind_group: young_trunk_mat.clone(),
-            },
-            InstancedDrawCall {
-                mesh: ydec_canopy_gpu,
-                instance_buffer: ydec_buf2,
-                instance_count: ydec_count,
-                material_bind_group: young_dec_canopy_mat,
-            },
-            InstancedDrawCall {
-                mesh: ypine_trunk_gpu,
-                instance_buffer: ypine_buf1,
-                instance_count: ypine_count,
-                material_bind_group: young_trunk_mat,
-            },
-            InstancedDrawCall {
-                mesh: ypine_canopy_gpu,
-                instance_buffer: ypine_buf2,
-                instance_count: ypine_count,
-                material_bind_group: young_pine_canopy_mat,
-            },
-        ];
-
-        let veg_total = dec_count + pine_count + bush_count + ydec_count + ypine_count;
-        log::info!(
-            "Vegetation: {} oak, {} pine, {} bush, {} young oak, {} young pine = {} total",
-            dec_count, pine_count, bush_count, ydec_count, ypine_count, veg_total
-        );
-
-        // --- Textured GLB trees (eastern species) ---
+        // --- Textured GLB trees ---
         self.tree_models.clear();
         if style.vegetation.use_eastern_species {
             let oak_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/oak.glb"));
@@ -532,53 +418,6 @@ impl App {
             }
         }
 
-        // --- Treeline strips (distant billboard trees) ---
-        // Skip when eastern species GLB trees are active — they provide enough coverage
-        // and the billboard quads look like bare poles from most angles
-        if !style.vegetation.use_eastern_species {
-            let treeline_config = TreelineConfig::default();
-            let (close_strip, far_strip) = generate_treeline_strips(
-                &self.route_points,
-                &treeline_config,
-                None,
-            );
-
-            if !close_strip.is_empty() {
-                let billboard_mesh = generate_billboard_quad();
-                let billboard_gpu = GpuMesh::from_cpu(&renderer.device, &billboard_mesh);
-                let close_mat = renderer.create_material(style.canopy_color);
-                let close_buf = renderer.create_instance_buffer(&close_strip);
-                self.instanced_draws.push(InstancedDrawCall {
-                    mesh: billboard_gpu,
-                    instance_buffer: close_buf,
-                    instance_count: close_strip.len() as u32,
-                    material_bind_group: close_mat,
-                });
-            }
-            if !far_strip.is_empty() {
-                let billboard_mesh = generate_billboard_quad();
-                let billboard_gpu = GpuMesh::from_cpu(&renderer.device, &billboard_mesh);
-                let far_color = [
-                    style.canopy_color[0] * 0.7 + style.fog_color[0] * 0.3,
-                    style.canopy_color[1] * 0.7 + style.fog_color[1] * 0.3,
-                    style.canopy_color[2] * 0.7 + style.fog_color[2] * 0.3,
-                    1.0,
-                ];
-                let far_mat = renderer.create_material(far_color);
-                let far_buf = renderer.create_instance_buffer(&far_strip);
-                self.instanced_draws.push(InstancedDrawCall {
-                    mesh: billboard_gpu,
-                    instance_buffer: far_buf,
-                    instance_count: far_strip.len() as u32,
-                    material_bind_group: far_mat,
-                });
-            }
-            log::info!(
-                "Treeline: {} close, {} far strips",
-                close_strip.len(), far_strip.len(),
-            );
-        }
-
         // --- Water features ---
         let water_features = detect_water_features(&self.route_points);
         let water_mat = renderer.create_material([0.05, 0.12, 0.18, 0.85]);
@@ -603,18 +442,21 @@ impl App {
         // Ground animal meshes
         let squirrel_mesh = GpuMesh::from_cpu(&renderer.device, &generate_squirrel());
         let deer_mesh = GpuMesh::from_cpu(&renderer.device, &generate_deer());
+        let turkey_mesh = GpuMesh::from_cpu(&renderer.device, &generate_turkey());
         let turtle_mesh = GpuMesh::from_cpu(&renderer.device, &generate_turtle());
         let egret_mesh = GpuMesh::from_cpu(&renderer.device, &generate_egret());
 
         // Ground animal materials
         let squirrel_mat = renderer.create_material([0.40, 0.28, 0.15, 1.0]); // brown
         let deer_mat = renderer.create_material([0.45, 0.35, 0.22, 1.0]); // tan
+        let turkey_mat = renderer.create_material([0.38, 0.26, 0.14, 1.0]); // warm brown-bronze
         let turtle_mat = renderer.create_material([0.25, 0.30, 0.15, 1.0]); // dark green
         let egret_mat = renderer.create_material([0.92, 0.90, 0.85, 1.0]); // white
 
         // Ground animal instance buffers and draw calls
         let squirrel_count = wildlife.squirrels.len() as u32;
         let deer_count = wildlife.deer.len() as u32;
+        let turkey_count = wildlife.turkeys.len() as u32;
         let turtle_count = wildlife.turtles.len() as u32;
         let egret_count = wildlife.egrets.len() as u32;
 
@@ -634,6 +476,15 @@ impl App {
                 instance_buffer: buf,
                 instance_count: deer_count,
                 material_bind_group: deer_mat,
+            });
+        }
+        if turkey_count > 0 {
+            let buf = renderer.create_instance_buffer(&wildlife.turkeys);
+            self.instanced_draws.push(InstancedDrawCall {
+                mesh: turkey_mesh,
+                instance_buffer: buf,
+                instance_count: turkey_count,
+                material_bind_group: turkey_mat,
             });
         }
         if turtle_count > 0 {
@@ -656,8 +507,8 @@ impl App {
         }
 
         log::info!(
-            "Ground animals: {} squirrels, {} deer, {} turtles, {} egrets",
-            squirrel_count, deer_count, turtle_count, egret_count
+            "Ground animals: {} squirrels, {} deer, {} turkeys, {} turtles, {} egrets",
+            squirrel_count, deer_count, turkey_count, turtle_count, egret_count
         );
 
         // Flying animal meshes (parameterized birds)
@@ -787,7 +638,7 @@ impl App {
             scale: 0.0,
             forward: [0.0, 1.0],
             pedal_phase: 0.0,
-            _pad: 0.0,
+            lean_angle: 0.0,
         });
         let cyclist_buf = renderer.create_cyclist_instance_buffer(&self.cyclist_cpu);
         let cyclist_count = self.cyclist_cpu.len() as u32;
@@ -874,6 +725,56 @@ impl App {
         self.prev_t = 0.0;
         self.camera_mode = CameraMode::ThirdPersonClose;
         self.state = AppState::Riding;
+        self.init_audio();
+    }
+
+    fn init_audio(&mut self) {
+        let synth = AudioSynth::new();
+        let params = AudioParams::default();
+        let shared = Arc::new(Mutex::new((synth, params)));
+        self.audio_shared = Some(shared.clone());
+
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                log::warn!("No audio output device found");
+                return;
+            }
+        };
+
+        let config = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(48000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let stream = match device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if let Ok(mut guard) = shared.lock() {
+                    let (synth, params) = &mut *guard;
+                    synth.set_params(*params);
+                    synth.fill_buffer(data);
+                }
+            },
+            |err| log::error!("Audio stream error: {err}"),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to create audio stream: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            log::warn!("Failed to play audio stream: {e}");
+            return;
+        }
+
+        self._audio_stream = Some(stream);
+        log::info!("Audio: initialized 48kHz stereo output");
     }
 }
 
@@ -935,7 +836,20 @@ impl ApplicationHandler for App {
                                     self.state = AppState::Selecting;
                                 }
                                 PhysicalKey::Code(KeyCode::KeyC) => {
+                                    let prev = self.camera_mode;
                                     self.camera_mode = self.camera_mode.next();
+                                    if self.camera_mode == CameraMode::FirstPerson && prev != CameraMode::FirstPerson {
+                                        let (px, pz, elev, _, _) = interpolate_point(
+                                            &self.route_points, self.physics_state.distance as f64,
+                                        );
+                                        self.fpv_camera.reset(Vec3::new(px, elev + 1.2, pz));
+                                    }
+                                }
+                                PhysicalKey::Code(KeyCode::KeyU) => {
+                                    self.rider_state.begin_uturn(
+                                        self.physics_state.distance,
+                                        &self.route_points,
+                                    );
                                 }
                                 _ => {}
                             }
@@ -1003,7 +917,12 @@ impl App {
         let renderer = self.renderer.as_mut().unwrap();
         renderer.update_hud(&hud_verts, &hud_indices);
 
-        match renderer.render(&[], &[], &[], &[], &[], &[], &[], &[], self.sky_color, &[], &[]) {
+        // Update sky and post-process for selector screen
+        let sky_uniforms = self.sky_state.uniforms(&self.camera);
+        renderer.update_sky(&sky_uniforms);
+        renderer.update_post_process(&self.post_process);
+
+        match renderer.render(&[], &[], &[], &[], &[], &[], &[], &[], &[], &[]) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
                 let (w, h) = (renderer.width, renderer.height);
@@ -1026,30 +945,95 @@ impl App {
             &self.route_points,
             self.route_length,
             dt,
+            self.rider_state.direction,
+            self.rider_state.topology,
         );
 
-        // Camera follows curved route using physics distance
+        // Auto-turnaround at endpoints for out-and-back routes
+        {
+            use sykla_engine::turnaround::{RouteDirection, RouteTopology, RiderPhase};
+            if self.rider_state.topology == RouteTopology::OutAndBack
+                && self.rider_state.phase == RiderPhase::OnRoute
+            {
+                let d = self.physics_state.distance;
+                match self.rider_state.direction {
+                    RouteDirection::Forward if d >= self.route_length - 5.0 => {
+                        self.rider_state.begin_uturn(d, &self.route_points);
+                    }
+                    RouteDirection::Reverse if d <= 5.0 => {
+                        self.rider_state.begin_uturn(d, &self.route_points);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Resolve rider position (direction-aware, with lateral offset)
         let dist = self.physics_state.distance;
-        let (px, pz, elev_here, fx, fz) = interpolate_point(&self.route_points, dist as f64);
-
-        // Perpendicular direction for camera offset
-        let perp_x = -fz;
-        let perp_z = fx;
-
-        // Mode-dependent camera parameters
-        let (behind, up, lateral, look_ahead, fov) = self.camera_mode.camera_params();
-
-        self.camera.fov_y = fov.to_radians();
-
-        self.camera.eye = Vec3::new(
-            px + perp_x * lateral - fx * behind,
-            elev_here + up,
-            pz + perp_z * lateral - fz * behind,
+        let resolved = self.rider_state.update(
+            dist,
+            self.physics_state.speed,
+            &self.route_points,
+            self.route_length,
+            dt,
         );
+        let (player_wx, player_wz) = resolved.offset_world_pos();
+        let elev_here = resolved.elevation;
+        let fx = resolved.forward_x;
+        let fz = resolved.forward_z;
 
-        let (ax, az, elev_ahead, _, _) = interpolate_point(&self.route_points, (dist + look_ahead) as f64);
-        let target_elev = elev_here.max(elev_ahead) + 2.0;
-        self.camera.target = Vec3::new(ax, target_elev, az);
+        if self.camera_mode == CameraMode::FirstPerson {
+            let (eye, target, fov) = self.fpv_camera.update(
+                &self.physics_state, &self.route_points, self.route_length, dt,
+                self.rider_state.direction,
+            );
+            self.camera.eye = eye;
+            self.camera.target = target;
+            self.camera.fov_y = fov;
+        } else {
+            let perp_x = -fz;
+            let perp_z = fx;
+            let (behind, up, lateral, look_ahead, fov) = self.camera_mode.camera_params();
+            self.camera.fov_y = fov.to_radians();
+            self.camera.eye = Vec3::new(
+                player_wx + perp_x * lateral - fx * behind,
+                elev_here + up,
+                player_wz + perp_z * lateral - fz * behind,
+            );
+            // Direction-aware look-ahead
+            use sykla_engine::turnaround::RouteDirection;
+            let ahead_dist = match self.rider_state.direction {
+                RouteDirection::Forward => (dist + look_ahead).min(self.route_length),
+                RouteDirection::Reverse => (dist - look_ahead).max(0.0),
+            };
+            let (ax, az, elev_ahead, _, _) = interpolate_point(&self.route_points, ahead_dist as f64);
+            let target_elev = elev_here.max(elev_ahead) + 2.0;
+            self.camera.target = Vec3::new(ax, target_elev, az);
+        }
+
+        // Update audio params
+        if let Some(ref shared) = self.audio_shared {
+            let style = routes::route_style(self.current_key);
+            let audio_params = AudioParams {
+                speed_mps: self.physics_state.speed,
+                cadence_rpm: self.physics_state.cadence as f32,
+                power_watts: self.physics_state.power_watts,
+                gradient: resolved.gradient,
+                elevation_m: self.physics_state.elevation,
+                surface: AudioSurface::from_surface_type(
+                    surface_at(&self.route_points, self.physics_state.distance as f64),
+                ),
+                biome: Biome::from_terrain_param(style.terrain_params[3]),
+                is_coasting: self.physics_state.cadence == 0
+                    && self.physics_state.speed > 0.5,
+                wheel_rps: self.physics_state.speed / 2.136,
+                forward_x: fx,
+                forward_z: fz,
+            };
+            if let Ok(mut guard) = shared.lock() {
+                guard.1 = audio_params;
+            }
+        }
 
         // Immutable renderer reference for camera/flying updates
         let renderer = match &self.renderer {
@@ -1109,6 +1093,10 @@ impl App {
             );
         }
 
+        // Player lean angle (using direction-aware curvature)
+        let lean_target = target_lean(self.physics_state.speed, resolved.curvature);
+        self.player_lean_angle = smooth_lean(self.player_lean_angle, lean_target, dt);
+
         // Update cyclist positions (CPU → GPU)
         self.cyclist_cpu = update_cyclists(
             &mut self.npc_cyclists,
@@ -1118,13 +1106,13 @@ impl App {
         );
         // Add player cyclist (visible in 3rd-person modes)
         if self.camera_mode != CameraMode::FirstPerson {
-            let player_pedal_phase = (dist / 5.3) * std::f32::consts::TAU;
+            let player_pedal_phase = self.physics_state.crank_angle;
             self.cyclist_cpu.push(CyclistInstanceData {
-                position: [px, elev_here + 0.08, pz],
+                position: [player_wx, elev_here + 0.08, player_wz],
                 scale: 1.0,
                 forward: [fx, fz],
                 pedal_phase: player_pedal_phase,
-                _pad: 0.0,
+                lean_angle: self.player_lean_angle,
             });
         }
         if !self.cyclist_models.is_empty() {
@@ -1144,6 +1132,11 @@ impl App {
         let renderer = self.renderer.as_mut().unwrap();
         renderer.update_hud(&hud_verts, &hud_indices);
 
+        // Update sky and post-process uniforms
+        let sky_uniforms = self.sky_state.uniforms(&self.camera);
+        renderer.update_sky(&sky_uniforms);
+        renderer.update_post_process(&self.post_process);
+
         match renderer.render(
             &self.draws,
             &self.road_draws,
@@ -1153,7 +1146,6 @@ impl App {
             &self.animated_draws,
             &self.cyclist_models,
             &self.water_draws,
-            self.sky_color,
             &self.emissive_instanced_draws,
             &self.tree_models,
         ) {

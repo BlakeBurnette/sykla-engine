@@ -92,6 +92,8 @@ impl RouteStyle {
             pine_color: [0.06, 0.22, 0.04, 1.0],
             bush_color: [0.14, 0.35, 0.08, 1.0],
             vegetation: VegetationConfig {
+                min_distance: 6.0,
+                max_distance: 130.0,
                 use_eastern_species: true,
                 fallen_tree_probability: 0.005,
                 ..Default::default()
@@ -130,8 +132,8 @@ impl RouteStyle {
             bush_color: [0.20, 0.28, 0.12, 1.0],
             vegetation: VegetationConfig {
                 spacing_m: 6.0,
-                min_distance: 4.0,
-                max_distance: 60.0,
+                min_distance: 6.0,
+                max_distance: 90.0,
                 trees_per_slot: 4,
                 min_scale: 0.3,
                 max_scale: 0.7,
@@ -172,8 +174,8 @@ impl RouteStyle {
             bush_color: [0.20, 0.28, 0.12, 1.0],
             vegetation: VegetationConfig {
                 spacing_m: 6.0,
-                min_distance: 4.0,
-                max_distance: 60.0,
+                min_distance: 6.0,
+                max_distance: 90.0,
                 trees_per_slot: 4,
                 min_scale: 0.3,
                 max_scale: 0.7,
@@ -215,7 +217,7 @@ impl RouteStyle {
             vegetation: VegetationConfig {
                 spacing_m: 25.0,
                 min_distance: 10.0,
-                max_distance: 50.0,
+                max_distance: 70.0,
                 trees_per_slot: 1,
                 min_scale: 0.2,
                 max_scale: 0.5,
@@ -255,8 +257,8 @@ impl RouteStyle {
             bush_color: [0.18, 0.32, 0.12, 1.0],
             vegetation: VegetationConfig {
                 spacing_m: 8.0,
-                min_distance: 5.0,
-                max_distance: 70.0,
+                min_distance: 6.0,
+                max_distance: 100.0,
                 trees_per_slot: 3,
                 min_scale: 0.5,
                 max_scale: 0.9,
@@ -299,7 +301,7 @@ impl RouteStyle {
             vegetation: VegetationConfig {
                 spacing_m: 4.0,
                 min_distance: 7.0,
-                max_distance: 40.0,
+                max_distance: 60.0,
                 trees_per_slot: 4,
                 min_scale: 0.8,
                 max_scale: 1.2,
@@ -473,6 +475,8 @@ pub fn generate_route(key: &str) -> (Vec<RoutePoint>, Option<GeoOrigin>) {
         }
     }
 
+    crate::terrain::compute_curvatures(&mut points);
+
     (points, geo_origin)
 }
 
@@ -544,6 +548,7 @@ fn generate_path(
             banking: 0.0,
             geo_x: pos_x as f32,
             geo_z: pos_z as f32,
+            curvature: 0.0,
         });
     }
 
@@ -630,43 +635,23 @@ fn generate_demo() -> Vec<RoutePoint> {
 // Elevation: 120m (Durham) dropping to 86m (New Hill).
 // ============================================================================
 
-static ATT_ELEVATION: [(f64, f64); 36] = [
-    (0.0, 120.0),      // Durham Bulls Athletic Park area
-    (1000.0, 118.5),
-    (2000.0, 116.0),
-    (3000.0, 113.5),
-    (4000.0, 111.0),
-    (5000.0, 109.0),    // South Durham
-    (6000.0, 107.5),
-    (7000.0, 106.0),
-    (8000.0, 105.0),
-    (9000.0, 107.0),    // Slight rise before I-40 tunnel
-    (10000.0, 109.0),   // I-40 pedestrian tunnel
-    (11000.0, 107.0),
-    (12000.0, 105.0),
-    (13000.0, 103.0),
-    (14000.0, 101.0),   // RTP area - Fayetteville Rd crossing
-    (15000.0, 100.0),
-    (16000.0, 98.5),
-    (17000.0, 97.0),
-    (18000.0, 96.0),
-    (19000.0, 97.5),    // Gentle rise approaching NC 54
-    (20000.0, 99.0),    // NC 54 crossing
-    (21000.0, 100.0),
-    (22000.0, 98.5),
-    (23000.0, 97.0),    // Entering Cary/Apex area
-    (24000.0, 95.0),
-    (25000.0, 93.5),
-    (26000.0, 92.0),    // White Oak Creek crossing
-    (27000.0, 91.0),
-    (28000.0, 93.0),    // Gentle rise past creek
-    (29000.0, 94.0),
-    (30000.0, 92.0),    // Green Level area
-    (31000.0, 90.5),
-    (32000.0, 89.0),    // Approaching Friendship
-    (33000.0, 88.0),
-    (34000.0, 87.0),
-    (35000.0, 86.0),    // New Hill terminus
+// GPX covers ~10.5km from Durham DBAP area south to Apex/I-40 tunnel area.
+// Rail trail: very gentle grades, max ~2%. Drops ~22m over 10.5km.
+static ATT_ELEVATION: [(f64, f64); 14] = [
+    (0.0, 120.0),       // Durham Bulls Athletic Park area
+    (800.0, 119.0),
+    (1600.0, 117.5),
+    (2400.0, 116.0),    // South Durham
+    (3200.0, 114.5),
+    (4000.0, 113.0),
+    (4800.0, 111.5),
+    (5600.0, 110.0),    // Approaching I-40
+    (6400.0, 108.5),
+    (7200.0, 107.0),    // I-40 area
+    (8000.0, 105.5),
+    (8800.0, 104.0),    // RTP corridor
+    (9600.0, 102.5),
+    (10500.0, 101.0),   // South end of GPX data
 ];
 
 // ============================================================================

@@ -53,7 +53,7 @@ impl TreeInstanceData {
     }
 }
 
-// ── Oak tree — 18m at scale 1.0 (40-80ft with scale variation) ──
+// ── Procedural tree meshes (kept for city vegetation fallback) ──
 
 pub fn generate_trunk() -> CpuMesh {
     let mut vertices = Vec::new();
@@ -458,14 +458,14 @@ impl Default for VegetationConfig {
     fn default() -> Self {
         Self {
             spacing_m: 5.0,
-            min_distance: 4.0,
-            max_distance: 90.0,
+            min_distance: 6.0,
+            max_distance: 130.0,
             trees_per_slot: 5,
             min_scale: 0.7,
             max_scale: 1.15,
             treeline: 99999.0,
-            use_eastern_species: false,
-            fallen_tree_probability: 0.0,
+            use_eastern_species: true,
+            fallen_tree_probability: 0.005,
         }
     }
 }
@@ -572,6 +572,8 @@ fn place_one(
     } else {
         procedural_terrain_y(y, side * x_off, terrain_half_width, terrain_falloff, wx, wz)
     };
+    // Sink tree base below terrain to guarantee no visible gap at ground level
+    let y = y - 0.3;
 
     // Treeline thinning: above treeline + 200m → skip entirely
     // Between treeline and treeline + 200m → probabilistic thinning
@@ -632,14 +634,32 @@ fn place_one_eastern(
     terrain_half_width: f32,
     terrain_falloff: f32,
 ) {
-    let x_off = config.min_distance + next_rng(rng) * (config.max_distance - config.min_distance);
     let z_jitter = (next_rng(rng) - 0.5) * config.spacing_m * 0.9;
     let kind = next_rng(rng);
-    let rotation_y = next_rng(rng) * TAU;
+    let base_rotation_y = next_rng(rng) * TAU;
+    let fallen = config.fallen_tree_probability > 0.0 && next_rng(rng) < config.fallen_tree_probability;
+
+    // Fallen trees must be well inside the forest (at least 25m from road center)
+    // so they never reach the path when they topple (~82° tilt).
+    let min_dist = if fallen { config.min_distance.max(25.0) } else { config.min_distance };
+    let x_off = min_dist + next_rng(rng) * (config.max_distance - min_dist);
 
     let dist_along = base_z + z_jitter as f64;
     let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
     let (wx, wz) = offset_position(px, pz, fx, fz, side * x_off);
+
+    // Fallen trees: rotation_y set so the tree falls AWAY from the road.
+    // The shader tilts in local +X after Y-rotation, so local +X becomes
+    // world (cos(ry), 0, -sin(ry)). We aim that at the perpendicular away direction.
+    let rotation_y = if fallen {
+        let perp_x = side * (-fz as f32);
+        let perp_z = side * (fx as f32);
+        // cos(ry) = perp_x, -sin(ry) = perp_z → ry = atan2(-perp_z, perp_x)
+        (-perp_z).atan2(perp_x)
+    } else {
+        base_rotation_y
+    };
+    let flags = if fallen { 1.0 } else { 0.0 };
 
     // Use DEM elevation at tree position if available (matches terrain mesh)
     // Otherwise apply procedural terrain falloff to match the terrain mesh
@@ -648,6 +668,8 @@ fn place_one_eastern(
     } else {
         procedural_terrain_y(y, side * x_off, terrain_half_width, terrain_falloff, wx, wz)
     };
+    // Sink tree base below terrain to guarantee no visible gap at ground level
+    let y = y - 0.3;
 
     // Treeline thinning
     if y > config.treeline + 200.0 {
@@ -659,10 +681,6 @@ fn place_one_eastern(
             return;
         }
     }
-
-    // Fallen tree check
-    let fallen = config.fallen_tree_probability > 0.0 && next_rng(rng) < config.fallen_tree_probability;
-    let flags = if fallen { 1.0 } else { 0.0 };
 
     if kind < 0.10 {
         // Redbud — understory, smaller scale, closer to road

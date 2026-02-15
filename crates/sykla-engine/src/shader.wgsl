@@ -216,7 +216,7 @@ fn compute_piedmont_floor(
     color = mix(color, clay, slope_dirt * 0.5);
 
     // Fine grain variation prevents "painted" look
-    color *= 0.85 + n_fine * 0.3;
+    color *= 0.75 + n_fine * 0.5;
 
     // Near path: more worn, bare soil visible
     let path_wear = smoothstep(0.02, 0.08, dist_from_center);
@@ -271,7 +271,7 @@ fn compute_alpine_ground(
     color = mix(color, rock, steep_rock * 0.6);
 
     // Fine grain
-    color *= 0.9 + n_fine * 0.2;
+    color *= 0.80 + n_fine * 0.4;
 
     return color;
 }
@@ -319,7 +319,7 @@ fn compute_desert_ground(
 
     // Fine grain
     let grain = fbm_n(world_pos.xz * 8.0, 1);
-    color *= 0.9 + grain * 0.2;
+    color *= 0.80 + grain * 0.4;
 
     // Near path — packed gravel/sand
     let path_wear = smoothstep(0.02, 0.06, dist_from_center);
@@ -358,7 +358,7 @@ fn compute_coastal_ground(
     color = mix(color, dark_soil, smoothstep(0.8, 0.95, n_broad) * 0.2);
 
     // Fine grain
-    color *= 0.88 + n_fine * 0.24;
+    color *= 0.76 + n_fine * 0.48;
 
     // Near path — compact sand/gravel
     let path_wear = smoothstep(0.02, 0.08, dist_from_center);
@@ -397,7 +397,7 @@ fn compute_forest_floor(
     color = mix(color, root_dirt, slope_dirt * 0.4);
 
     // Fine grain
-    color *= 0.85 + n_fine * 0.3;
+    color *= 0.75 + n_fine * 0.5;
 
     // Near path — packed dirt
     let path_wear = smoothstep(0.02, 0.08, dist_from_center);
@@ -405,6 +405,36 @@ fn compute_forest_floor(
     color = mix(trail_dirt, color, path_wear);
 
     return color;
+}
+
+// --- Terrain bump normal ---
+
+/// Multi-scale terrain normal perturbation from noise derivatives.
+/// Three scales: broad geological (~7m), medium clumps (~1.2m), fine grain (~25cm).
+/// Returns a perturbed normal vector — apply before lighting.
+fn terrain_bump_normal(N: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    let wp = world_pos.xz;
+    let eps = 0.05;
+
+    // Scale 1: broad geological undulation (~7m wavelength)
+    let s1 = 0.14; // 1/7m
+    let n1_x0 = noise2d((wp + vec2<f32>(eps, 0.0)) * s1) - noise2d((wp - vec2<f32>(eps, 0.0)) * s1);
+    let n1_z0 = noise2d((wp + vec2<f32>(0.0, eps)) * s1) - noise2d((wp - vec2<f32>(0.0, eps)) * s1);
+    let grad1 = vec3<f32>(n1_x0, 0.0, n1_z0) * 0.35;
+
+    // Scale 2: medium clumps (~1.2m wavelength)
+    let s2 = 0.83; // 1/1.2m
+    let n2_x0 = noise2d((wp + vec2<f32>(eps, 0.0)) * s2) - noise2d((wp - vec2<f32>(eps, 0.0)) * s2);
+    let n2_z0 = noise2d((wp + vec2<f32>(0.0, eps)) * s2) - noise2d((wp - vec2<f32>(0.0, eps)) * s2);
+    let grad2 = vec3<f32>(n2_x0, 0.0, n2_z0) * 0.25;
+
+    // Scale 3: fine grain (~25cm wavelength)
+    let s3 = 4.0; // 1/0.25m
+    let n3_x0 = noise2d((wp + vec2<f32>(eps, 0.0)) * s3) - noise2d((wp - vec2<f32>(eps, 0.0)) * s3);
+    let n3_z0 = noise2d((wp + vec2<f32>(0.0, eps)) * s3) - noise2d((wp - vec2<f32>(0.0, eps)) * s3);
+    let grad3 = vec3<f32>(n3_x0, 0.0, n3_z0) * 0.15;
+
+    return normalize(N + grad1 + grad2 + grad3);
 }
 
 // --- Shadow sampling ---
@@ -507,6 +537,32 @@ fn color_grade(color: vec3<f32>) -> vec3<f32> {
     return clamp(mapped, vec3(0.0), vec3(1.0));
 }
 
+// --- Volumetric light shafts (god rays) ---
+
+fn volumetric_light(world_pos: vec3<f32>) -> vec3<f32> {
+    let ray = camera.eye_pos.xyz - world_pos;
+    let ray_len = min(length(ray), 80.0);
+    let ray_dir = normalize(ray);
+    let step_vec = ray_dir * (ray_len / 12.0);
+    var accum = 0.0;
+    var pos = world_pos;
+    for (var i = 0u; i < 12u; i++) {
+        pos += step_vec;
+        let sp = world_to_shadow(pos);
+        let in_bounds = sp.x >= 0.001 && sp.x <= 0.999
+                     && sp.y >= 0.001 && sp.y <= 0.999
+                     && sp.z <= 1.0;
+        let uv = clamp(sp.xy, vec2<f32>(0.001), vec2<f32>(0.999));
+        let lit = textureSampleCompare(shadow_tex, shadow_samp, uv, sp.z - 0.002);
+        accum += select(lit, 1.0, !in_bounds);
+    }
+    let view_dir = normalize(world_pos - camera.eye_pos.xyz);
+    let sun_dir = normalize(-light.direction.xyz);
+    let phase = pow(max(dot(view_dir, sun_dir), 0.0), 8.0);
+    let warm = vec3<f32>(1.0, 0.9, 0.7);
+    return accum / 12.0 * phase * 0.20 * warm * light.color.w;
+}
+
 // --- Fragment shader ---
 
 @fragment
@@ -580,15 +636,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         base_color = mix(base_color, snow_color, snow_t);
     }
 
-    // Lighting
-    let NdotL = dot(N, L);
+    // Terrain bump normal — multi-scale perturbation for visible surface texture
+    let N_bumped = terrain_bump_normal(N, in.world_pos);
+
+    // Lighting (use bumped normal for all terrain lighting)
+    let NdotL = dot(N_bumped, L);
     let diff = max(NdotL, 0.0);
     let wrap_diff = max(NdotL * 0.5 + 0.5, 0.0);
-    let spec = pow(max(dot(N, H), 0.0), 64.0);
+    let spec = pow(max(dot(N_bumped, H), 0.0), 64.0);
 
     // Subsurface-like translucency for foliage — warm glow when backlit
     // Reduce above treeline (high zones are rock/snow, not foliage)
-    let back_light = max(dot(-N, L), 0.0);
+    let back_light = max(dot(-N_bumped, L), 0.0);
     let sss_color = vec3<f32>(0.45, 0.55, 0.1); // warm yellow-green glow
     let sss_strength = 0.35 * (1.0 - t_high);
     let sss = back_light * back_light * sss_strength * sss_color * base_color;
@@ -597,7 +656,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let shadow = shadow_factor_biased(in.shadow_pos, normalize(in.world_normal));
 
     // Warm fill light from ground bounce
-    let ground_bounce = max(N.y, 0.0) * 0.08;
+    let ground_bounce = max(N_bumped.y, 0.0) * 0.08;
     let bounce_color = vec3<f32>(0.3, 0.35, 0.1) * base_color * ground_bounce;
 
     // Combine — warm ambient with wrap lighting
@@ -608,9 +667,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let direct = shadow * (diff * sun_warm * base_color + spec * sun_warm * 0.06);
     var color = ambient + direct + sss * shadow + bounce_color;
 
+    // Volumetric light shafts (god rays through tree canopy)
+    color += volumetric_light(in.world_pos);
+
     // Atmospheric perspective
     color = apply_atmosphere(color, in.world_pos);
-    color = color_grade(color);
 
     return vec4<f32>(color, 1.0);
 }
@@ -624,48 +685,310 @@ fn fs_road(in: VertexOutput) -> @location(0) vec4<f32> {
     let V = normalize(camera.eye_pos.xyz - in.world_pos);
     let H = normalize(L + V);
 
-    // Subtle micro-texture — very fine asphalt/gravel grain
-    let n1 = noise2d(in.world_pos.xz * 2.0);
-    let n2 = noise2d(in.world_pos.xz * 8.0);
-    let color_var = material.base_color.xyz
-        * (0.92 + 0.08 * n1)
-        * (0.96 + 0.04 * n2);
+    let ux = in.uv.x;           // 0=left edge, 1=right edge
+    let edge = abs(ux - 0.5) * 2.0; // 0 at center, 1 at edge
 
-    // Road edge darkening — darken near uv.x = 0 or 1
-    let edge = abs(in.uv.x - 0.5) * 2.0; // 0 at center, 1 at edge
-    let edge_darken = 1.0 - edge * edge * 0.25;
-    var base_color = color_var * edge_darken;
+    var base_color: vec3<f32>;
+    var surface_spec = 32.0;
+    var spec_strength = 0.04;
 
-    // European road markings (when zone_params.x > 0.5)
-    if (material.zone_params.x > 0.5) {
-        let road_dist = in.uv.y; // meters along route
-        let ux = in.uv.x;
-        // Center dashed: 3m on, 3m off (6m period), 0.5m wide at center
-        let center = smoothstep(0.48, 0.485, ux) * (1.0 - smoothstep(0.515, 0.52, ux));
-        let dash = step(0.5, fract(road_dist / 6.0));
-        // Solid edge lines: ~0.3m wide at each edge
-        let left_edge = smoothstep(0.02, 0.03, ux) * (1.0 - smoothstep(0.06, 0.07, ux));
-        let right_edge = smoothstep(0.93, 0.94, ux) * (1.0 - smoothstep(0.97, 0.98, ux));
-        let mark = clamp(center * dash + left_edge + right_edge, 0.0, 1.0);
-        base_color = mix(base_color, vec3<f32>(0.92, 0.92, 0.88), mark * 0.85);
+    let is_gravel = material.terrain_params.x > 0.5;
+
+    var N_perturbed = N;
+
+    if (is_gravel) {
+        // ── Packed dirt/crushed stone trail (American Tobacco Trail style) ──
+        // Goal: feel every grain, see the pine needles, sense the depth.
+
+        let wp = in.world_pos.xz;
+        let road_dist = in.uv.y;
+        let cam_dist = length(camera.eye_pos.xyz - in.world_pos);
+        let close_detail = 1.0 - smoothstep(3.0, 15.0, cam_dist);
+        let mid_detail = 1.0 - smoothstep(8.0, 30.0, cam_dist);
+
+        // ── Color palette ──
+        let stone_base = material.base_color.xyz;
+        let stone_warm = vec3<f32>(0.68, 0.55, 0.38);  // warm sandy stone
+        let stone_cool = vec3<f32>(0.62, 0.62, 0.60);  // cool gray gravel
+        let dirt_color = vec3<f32>(0.48, 0.36, 0.22);   // exposed dirt
+        let clay_color = vec3<f32>(0.58, 0.32, 0.18);   // reddish clay patches
+        let needle_dark = vec3<f32>(0.28, 0.15, 0.06);  // dry pine needle
+        let needle_light = vec3<f32>(0.45, 0.28, 0.12); // fresher needle
+        let cone_color = vec3<f32>(0.22, 0.14, 0.07);   // pinecone
+
+        // ── Individual gravel grains (voronoi-like cells) ──
+        // Each grain is a tiny stone with its own color and height
+        let grain_scale = 50.0; // ~2cm grains
+        let gc = floor(wp * grain_scale);
+        let gf = fract(wp * grain_scale);
+        let grain_h = hash(gc);
+        let grain_h2 = hash(gc + vec2<f32>(7.3, 13.1));
+        let grain_h3 = hash(gc + vec2<f32>(31.7, 5.9));
+        // Distance to grain center (jittered)
+        let grain_center = vec2<f32>(grain_h * 0.6 + 0.2, grain_h2 * 0.6 + 0.2);
+        let grain_dist = length(gf - grain_center);
+        // Each grain has a rounded top — creates depth
+        let grain_bump = 1.0 - smoothstep(0.0, 0.38, grain_dist);
+        // Grain-to-grain crevice shadow
+        let grain_crevice = smoothstep(0.30, 0.42, grain_dist);
+
+        // Per-grain color variation: warm stone, cool stone, or quartz-white
+        let grain_tone = mix(
+            mix(stone_warm, stone_cool, step(0.5, grain_h)),
+            stone_base * 1.15, // occasional bright quartz grain
+            step(0.88, grain_h3)
+        );
+        var trail = grain_tone
+            * (0.85 + 0.15 * grain_bump * close_detail)
+            * (1.0 - grain_crevice * 0.12 * close_detail);
+
+        // Normal perturbation from gravel grains — gives 3D depth
+        let grain_nx = (hash(gc + vec2<f32>(0.5, 0.0)) - hash(gc - vec2<f32>(0.5, 0.0))) * grain_bump;
+        let grain_nz = (hash(gc + vec2<f32>(0.0, 0.5)) - hash(gc - vec2<f32>(0.0, 0.5))) * grain_bump;
+        N_perturbed = normalize(N + vec3<f32>(grain_nx, 0.0, grain_nz) * 0.15 * close_detail);
+
+        // ── Multi-scale terrain variation ──
+        let broad_var = fbm_n(wp * 0.8, 3);   // large geological patches
+        let med_var = noise2d(wp * 4.0);       // puddle/wear zones
+        let fine_var = noise2d(wp * 18.0);     // gravel clump variation
+        trail *= 0.90 + 0.10 * broad_var;
+        trail *= 0.94 + 0.06 * fine_var * mid_detail;
+
+        // ── Dirt patches and clay showing through ──
+        let dirt_mask = smoothstep(0.42, 0.62, fbm_n(wp * 1.8, 3));
+        trail = mix(trail, dirt_color * (0.88 + 0.12 * fine_var), dirt_mask * 0.40);
+        // Occasional reddish clay
+        let clay_mask = smoothstep(0.68, 0.78, noise2d(wp * 2.5 + 100.0));
+        trail = mix(trail, clay_color, clay_mask * 0.20);
+
+        // ── Tire tracks — two worn paths with real depth ──
+        let track_l = exp(-pow((ux - 0.30) / 0.07, 2.0));
+        let track_r = exp(-pow((ux - 0.70) / 0.07, 2.0));
+        let track = max(track_l, track_r);
+        // Compacted surface: smoother grains, darker, slightly shinier from wear
+        let compacted_color = stone_base * vec3<f32>(0.78, 0.77, 0.76);
+        trail = mix(trail, compacted_color, track * 0.45);
+        // Flatten grain bumps in tracks (smoother surface)
+        N_perturbed = mix(N_perturbed, N, track * 0.6);
+
+        // Tire tread marks — subtle wavy parallel lines
+        let tread1 = sin(road_dist * 12.0 + noise2d(wp * 3.0) * 3.0) * 0.5 + 0.5;
+        let tread2 = sin(road_dist * 12.0 + 1.5 + noise2d(wp * 3.0 + 5.0) * 3.0) * 0.5 + 0.5;
+        trail -= vec3<f32>(tread1 * track_l * 0.05 * mid_detail);
+        trail -= vec3<f32>(tread2 * track_r * 0.05 * mid_detail);
+
+        // Track edge — slight berm of displaced gravel
+        let berm_l1 = exp(-pow((ux - 0.22) / 0.02, 2.0));
+        let berm_l2 = exp(-pow((ux - 0.38) / 0.02, 2.0));
+        let berm_r1 = exp(-pow((ux - 0.62) / 0.02, 2.0));
+        let berm_r2 = exp(-pow((ux - 0.78) / 0.02, 2.0));
+        let berms = max(max(berm_l1, berm_l2), max(berm_r1, berm_r2));
+        trail = mix(trail, trail * 1.10, berms * 0.25 * mid_detail);
+
+        // ── Loose gravel center ridge ──
+        let center_ridge = exp(-pow((ux - 0.50) / 0.06, 2.0));
+        trail = mix(trail, trail * 1.06, center_ridge * 0.25);
+        // Ridge has slightly raised normal
+        N_perturbed = normalize(N_perturbed + vec3<f32>(0.0, 0.0, 0.0) +
+            N * center_ridge * 0.03 * close_detail);
+
+        // ── Pine needles — multiple scales, visible and 3D ──
+        // Large needles (individual, clearly visible)
+        let ns1 = 0.10; // ~10cm cells for big needles
+        let nc1 = floor(wp / ns1);
+        let nf1 = fract(wp / ns1);
+        let nh1 = hash(nc1);
+        let nh1b = hash(nc1 + vec2<f32>(3.7, 11.3));
+        let needle1_on = step(0.60, nh1); // 40% of cells
+        let na1 = nh1 * 6.28;
+        let nc1_c = nf1 - vec2<f32>(nh1b * 0.4 + 0.3, hash(nc1 + 2.0) * 0.4 + 0.3);
+        let nr1x = nc1_c.x * cos(na1) - nc1_c.y * sin(na1);
+        let nr1y = nc1_c.x * sin(na1) + nc1_c.y * cos(na1);
+        // Tapered needle shape — wider in middle, pointed at ends
+        let needle1_width = 0.06 * (1.0 - abs(nr1y) / 0.40);
+        let needle1_body = step(abs(nr1x), max(needle1_width, 0.0)) * step(abs(nr1y), 0.40);
+        let needle1_vis = needle1_on * needle1_body;
+
+        // Needle color varies — some dry/orange, some dark brown
+        let n1_col = mix(needle_dark, needle_light, nh1b);
+        // Needle shadow — shifted slightly in light direction
+        let shadow_offset = vec2<f32>(0.15, 0.10);
+        let nc1_s = nf1 - vec2<f32>(nh1b * 0.4 + 0.3, hash(nc1 + 2.0) * 0.4 + 0.3) + shadow_offset * 0.3;
+        let ns1x = nc1_s.x * cos(na1) - nc1_s.y * sin(na1);
+        let ns1y = nc1_s.x * sin(na1) + nc1_s.y * cos(na1);
+        let needle1_shadow = step(abs(ns1x), needle1_width * 1.3) * step(abs(ns1y), 0.42)
+            * needle1_on * (1.0 - needle1_body); // shadow only where needle isn't
+
+        // Small needle clusters (pine needle litter — groups of 2-3)
+        let ns2 = 0.06; // 6cm cells, denser
+        let nc2 = floor(wp / ns2);
+        let nf2 = fract(wp / ns2);
+        let nh2 = hash(nc2 + vec2<f32>(17.0, 23.0));
+        let nh2b = hash(nc2 + vec2<f32>(41.0, 7.0));
+        let needle2_on = step(0.55, nh2); // 45% cells
+        let na2 = nh2b * 6.28;
+        let nc2_c = nf2 - 0.5;
+        let nr2x = nc2_c.x * cos(na2) - nc2_c.y * sin(na2);
+        let nr2y = nc2_c.x * sin(na2) + nc2_c.y * cos(na2);
+        let needle2_body = step(abs(nr2x), 0.04) * step(abs(nr2y), 0.30);
+        let needle2_vis = needle2_on * needle2_body;
+
+        // Density: heavy at edges, lighter in tracks, moderate elsewhere
+        let needle_density = mix(1.0, 0.15, track) * (0.4 + 0.6 * smoothstep(0.3, 0.9, edge));
+
+        // Apply needles with depth
+        // Shadow first (darkens ground under/beside needle)
+        trail *= 1.0 - needle1_shadow * needle_density * 0.15 * mid_detail;
+        // Then the needle on top
+        let n1_final = n1_col * (0.75 + 0.25 * (0.5 + 0.5 * nr1y / 0.40)); // lighter in middle
+        trail = mix(trail, n1_final, needle1_vis * needle_density * 0.90 * mid_detail);
+        // Small needle cluster
+        let n2_col = mix(needle_dark, needle_light, nh2) * 0.9;
+        trail = mix(trail, n2_col, needle2_vis * needle_density * 0.80 * mid_detail);
+
+        // Needle normal perturbation — they sit on top of the surface
+        let needle_bump = (needle1_vis + needle2_vis * 0.5) * needle_density * close_detail;
+        N_perturbed = normalize(N_perturbed + vec3<f32>(
+            cos(na1) * needle1_vis + cos(na2) * needle2_vis * 0.5,
+            0.0,
+            sin(na1) * needle1_vis + sin(na2) * needle2_vis * 0.5
+        ) * needle_density * 0.06 * close_detail);
+
+        // ── Pinecones — 3D bumps with texture ──
+        let cone_cell = 0.7;
+        let cc = floor(wp / cone_cell);
+        let cf = fract(wp / cone_cell);
+        let cone_h = hash(cc + 42.0);
+        let cone_h2 = hash(cc + vec2<f32>(55.0, 13.0));
+        let cone_on = step(0.92, cone_h); // ~8% of cells
+        let cone_pos = vec2<f32>(cone_h2 * 0.4 + 0.3, hash(cc + 77.0) * 0.4 + 0.3);
+        let cone_d = length(cf - cone_pos);
+        let cone_r = 0.04 + cone_h * 0.03; // 4-7cm radius
+        let cone_body = 1.0 - smoothstep(0.0, cone_r, cone_d);
+        let cone_vis = cone_on * cone_body;
+        // Scale texture on cone surface
+        let cone_scales = sin(cone_d * 120.0) * 0.5 + 0.5;
+        let cone_col = cone_color * (0.8 + 0.2 * cone_scales);
+        trail = mix(trail, cone_col, cone_vis * 0.85 * mid_detail);
+        // Cone casts tiny shadow
+        let cone_shadow_d = length(cf - cone_pos + vec2<f32>(0.04, 0.03));
+        let cone_shadow = (1.0 - smoothstep(cone_r, cone_r + 0.04, cone_shadow_d)) * cone_on;
+        trail *= 1.0 - cone_shadow * 0.12 * (1.0 - cone_body) * mid_detail;
+        // Cone bump in normal
+        N_perturbed = normalize(N_perturbed +
+            vec3<f32>(cf.x - cone_pos.x, 0.0, cf.y - cone_pos.y) * cone_vis * 0.20 * close_detail);
+
+        // ── Edge transition — thick organic debris ──
+        let edge_debris = smoothstep(0.70, 1.0, edge);
+        let debris_fbm = fbm_n(wp * 4.0, 3);
+        let debris_fine = noise2d(wp * 25.0);
+        let debris_col = mix(
+            needle_dark * 0.7,
+            vec3<f32>(0.30, 0.20, 0.08),
+            debris_fbm
+        ) * (0.85 + 0.15 * debris_fine);
+        trail = mix(trail, debris_col, edge_debris * 0.70);
+        // Debris has lumpy normals
+        let debris_nx = (noise2d(wp * 20.0 + vec2<f32>(1.0, 0.0)) - noise2d(wp * 20.0 - vec2<f32>(1.0, 0.0)));
+        let debris_nz = (noise2d(wp * 20.0 + vec2<f32>(0.0, 1.0)) - noise2d(wp * 20.0 - vec2<f32>(0.0, 1.0)));
+        N_perturbed = normalize(N_perturbed +
+            vec3<f32>(debris_nx, 0.0, debris_nz) * edge_debris * 0.08 * mid_detail);
+
+        // ── Moisture variation — damp patches darker/shinier ──
+        let damp = smoothstep(0.55, 0.70, noise2d(wp * 1.2 + 200.0));
+        trail *= 1.0 - damp * 0.15;
+
+        // Edge darkening
+        let edge_darken = 1.0 - edge * edge * 0.35;
+        base_color = trail * edge_darken;
+
+        // Gravel is mostly matte, but damp spots and tracks have slight sheen
+        surface_spec = 8.0 + track * 16.0 + damp * 20.0;
+        spec_strength = 0.01 + track * 0.02 + damp * 0.03;
+
+    } else {
+        // ── Paved asphalt surface — aggregate texture + normal perturbation ──
+        let wp = in.world_pos.xz;
+        let cam_dist = length(camera.eye_pos.xyz - in.world_pos);
+        let pave_detail = 1.0 - smoothstep(5.0, 20.0, cam_dist);
+
+        // Base noise — boosted contrast
+        let n1 = noise2d(wp * 2.0);
+        let n2 = noise2d(wp * 8.0);
+        var paved = material.base_color.xyz
+            * (0.82 + 0.18 * n1)
+            * (0.90 + 0.10 * n2);
+
+        // Asphalt aggregate pattern — hash-based stone chips at ~2.5cm scale
+        let agg_scale = 40.0; // ~2.5cm cells
+        let agg_cell = floor(wp * agg_scale);
+        let agg_f = fract(wp * agg_scale);
+        let agg_h = hash(agg_cell);
+        let agg_h2 = hash(agg_cell + vec2<f32>(17.3, 31.1));
+        // Per-chip color: lighter or darker stones in aggregate mix
+        let chip_tone = 0.88 + agg_h * 0.24; // 0.88-1.12 range
+        paved *= mix(1.0, chip_tone, pave_detail * 0.5);
+        // Chip bump: small rounded bumps for each stone in the aggregate
+        let chip_center = vec2<f32>(agg_h * 0.4 + 0.3, agg_h2 * 0.4 + 0.3);
+        let chip_dist = length(agg_f - chip_center);
+        let chip_bump = 1.0 - smoothstep(0.0, 0.30, chip_dist);
+        // Aggregate gap shadow (bitumen between stones)
+        let gap_dark = smoothstep(0.28, 0.38, chip_dist);
+        paved *= 1.0 - gap_dark * 0.06 * pave_detail;
+
+        // Aggregate normal perturbation — visible bumpy surface under lighting
+        let agg_nx = (hash(agg_cell + vec2<f32>(0.5, 0.0)) - hash(agg_cell - vec2<f32>(0.5, 0.0))) * chip_bump;
+        let agg_nz = (hash(agg_cell + vec2<f32>(0.0, 0.5)) - hash(agg_cell - vec2<f32>(0.0, 0.5))) * chip_bump;
+        N_perturbed = normalize(N + vec3<f32>(agg_nx, 0.0, agg_nz) * 0.10 * pave_detail);
+
+        // Broad surface undulations — patches and repairs
+        let broad_n = fbm_n(wp * 0.4, 2);
+        N_perturbed = normalize(N_perturbed + vec3<f32>(
+            noise2d(wp * 0.8 + vec2<f32>(1.0, 0.0)) - noise2d(wp * 0.8 - vec2<f32>(1.0, 0.0)),
+            0.0,
+            noise2d(wp * 0.8 + vec2<f32>(0.0, 1.0)) - noise2d(wp * 0.8 - vec2<f32>(0.0, 1.0)),
+        ) * 0.04);
+
+        // Wheel track wear darkening at lateral positions ~0.30 and ~0.70
+        let wear_l = exp(-pow((ux - 0.30) / 0.08, 2.0));
+        let wear_r = exp(-pow((ux - 0.70) / 0.08, 2.0));
+        let wear = max(wear_l, wear_r);
+        paved *= 1.0 - wear * 0.10;
+        // Worn tracks are smoother (less aggregate bump)
+        N_perturbed = mix(N_perturbed, N, wear * 0.4);
+
+        let edge_darken = 1.0 - edge * edge * 0.25;
+        base_color = paved * edge_darken;
+
+        // European road markings (when zone_params.x > 0.5)
+        if (material.zone_params.x > 0.5) {
+            let road_dist = in.uv.y;
+            let center = smoothstep(0.48, 0.485, ux) * (1.0 - smoothstep(0.515, 0.52, ux));
+            let dash = step(0.5, fract(road_dist / 6.0));
+            let left_edge = smoothstep(0.02, 0.03, ux) * (1.0 - smoothstep(0.06, 0.07, ux));
+            let right_edge = smoothstep(0.93, 0.94, ux) * (1.0 - smoothstep(0.97, 0.98, ux));
+            let mark = clamp(center * dash + left_edge + right_edge, 0.0, 1.0);
+            base_color = mix(base_color, vec3<f32>(0.92, 0.92, 0.88), mark * 0.85);
+        }
     }
 
-    // Lighting (simpler than terrain — no subsurface)
-    let NdotL = dot(N, L);
+    // Lighting — use perturbed normal for both paved and gravel
+    let shade_N = N_perturbed;
+    let shade_H = normalize(L + V);
+    let NdotL = dot(shade_N, L);
     let diff = max(NdotL, 0.0);
-    let spec = pow(max(dot(N, H), 0.0), 32.0);
+    let spec = pow(max(dot(shade_N, shade_H), 0.0), surface_spec);
 
     // Shadow
     let shadow = shadow_factor_biased(in.shadow_pos, normalize(in.world_normal));
 
     let ambient = light.ambient.xyz * base_color * 0.6;
     let sun = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85);
-    let direct = shadow * (diff * sun * base_color + spec * sun * 0.04);
+    let direct = shadow * (diff * sun * base_color + spec * sun * spec_strength);
     var color = ambient + direct;
 
     // Exponential atmospheric fog
     color = apply_atmosphere(color, in.world_pos);
-    color = color_grade(color);
 
     return vec4<f32>(color, 1.0);
 }
@@ -754,9 +1077,15 @@ fn fs_grass_shell(in: GrassVertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Per-blade color variation
+    // Per-blade color variation with dead blade mix
     let blade_var = hash(floor(in.world_pos.xz * 12.0));
     var grass_color = mix(root_color, tip_color, t);
+    // 15% of shell cells rendered as straw yellow-brown (dead grass)
+    let dead_cell = hash(floor(in.world_pos.xz * 8.0 + vec2<f32>(17.3, 31.7)));
+    if (dead_cell > 0.85) {
+        let straw = mix(vec3<f32>(0.45, 0.38, 0.18), vec3<f32>(0.60, 0.50, 0.22), t);
+        grass_color = straw;
+    }
     grass_color *= 0.85 + blade_var * 0.3;
 
     // Self-shadowing — base is slightly darker (occluded by blades above)
@@ -780,9 +1109,6 @@ fn fs_grass_shell(in: GrassVertexOutput) -> @location(0) vec4<f32> {
     // Atmospheric perspective
     color = apply_atmosphere(color, in.world_pos);
 
-    // Tone mapping
-    color = color / (color + vec3<f32>(1.0));
-
     // Distance fade
     let dist = length(camera.eye_pos.xyz - in.world_pos);
     let fade = 1.0 - smoothstep(fade_start, fade_end, dist);
@@ -792,7 +1118,6 @@ fn fs_grass_shell(in: GrassVertexOutput) -> @location(0) vec4<f32> {
 
     // Per-shell opacity — controlled so overlapping shells accumulate naturally
     let shell_alpha = 0.55;
-    color = color_grade(color);
 
     return vec4<f32>(color, fade * base_fade * shell_alpha);
 }
@@ -847,10 +1172,12 @@ fn vs_grass_blade(in: VertexInput, blade: GrassBladeInput) -> GrassBladeOutput {
     local.x += lean_x * blade.blade_height;
     local.z += lean_z * blade.blade_height;
 
-    // Wind bend — quadratic (tips move ~4x more than midpoints)
+    // Wind bend — quadratic (tips move ~4x more than midpoints), boosted 1.5x
     let wind_phase = dot(blade.blade_pos.xz, wind_dir * 0.8) + time * 2.5;
     let gust = sin(time * 0.7 + blade.blade_pos.x * 0.1) * 0.3 + 0.7;
-    let wind_bend = sin(wind_phase) * wind_strength * t * t * gust;
+    // Secondary gust wave at different frequency for natural variation
+    let gust2 = sin(time * 1.3 + blade.blade_pos.z * 0.15 + 2.7) * 0.2 + 0.8;
+    let wind_bend = sin(wind_phase) * wind_strength * 1.5 * t * t * gust * gust2;
     local.x += wind_dir.x * wind_bend * blade.blade_height;
     local.z += wind_dir.y * wind_bend * blade.blade_height;
 
@@ -896,14 +1223,41 @@ fn fs_grass_blade(in: GrassBladeOutput) -> @location(0) vec4<f32> {
     let N = normalize(in.world_normal);
     let L = normalize(-light.direction.xyz);
     let V = normalize(camera.eye_pos.xyz - in.world_pos);
+    let color_var = in.color_var;
 
     // Color gradient from root to tip
     let root_color = material.base_color.xyz;
     let tip_color = material.mid_color.xyz;
-    var blade_color = mix(root_color, tip_color, t);
+    var blade_color: vec3<f32>;
 
-    // Per-blade color variation
-    blade_color *= 0.85 + in.color_var * 0.30;
+    if (color_var >= 0.95) {
+        // Fallen leaf — brown/red/yellow with vein-like pattern
+        let leaf_h = hash(floor(in.world_pos.xz * 3.0));
+        let leaf_brown = vec3<f32>(0.42, 0.28, 0.10);
+        let leaf_red = vec3<f32>(0.55, 0.18, 0.08);
+        let leaf_yellow = vec3<f32>(0.65, 0.52, 0.12);
+        blade_color = mix(leaf_brown, mix(leaf_red, leaf_yellow, leaf_h), fract(leaf_h * 7.0));
+        // Vein pattern
+        let vein = abs(sin(in.world_pos.x * 40.0 + in.world_pos.z * 20.0));
+        blade_color *= 0.85 + vein * 0.15;
+    } else if (color_var >= 0.85) {
+        // Dead/dry grass — straw yellow-brown
+        let straw_root = vec3<f32>(0.45, 0.38, 0.18);
+        let straw_tip = vec3<f32>(0.62, 0.52, 0.22);
+        blade_color = mix(straw_root, straw_tip, t);
+        blade_color *= 0.88 + hash(floor(in.world_pos.xz * 5.0)) * 0.24;
+    } else if (color_var >= 0.70) {
+        // Weed — taller, darker green
+        let weed_root = root_color * vec3<f32>(0.70, 0.75, 0.65);
+        let weed_tip = vec3<f32>(0.22, 0.40, 0.10);
+        blade_color = mix(weed_root, weed_tip, t);
+        blade_color *= 0.85 + hash(floor(in.world_pos.xz * 4.0)) * 0.20;
+    } else {
+        // Normal grass
+        blade_color = mix(root_color, tip_color, t);
+        // Per-blade color variation (use color_var within 0-0.69 range scaled up)
+        blade_color *= 0.85 + (color_var / 0.70) * 0.30;
+    }
 
     // Self-shadowing / AO — base is darker
     blade_color *= mix(0.55, 1.0, t);
@@ -931,15 +1285,11 @@ fn fs_grass_blade(in: GrassBladeOutput) -> @location(0) vec4<f32> {
     // Atmospheric perspective
     color = apply_atmosphere(color, in.world_pos);
 
-    // Tone mapping
-    color = color / (color + vec3<f32>(1.0));
-
     // Distance fade
     let dist = length(camera.eye_pos.xyz - in.world_pos);
     let fade_start = material.zone_params.x;
     let fade_end = material.zone_params.y;
     let fade = 1.0 - smoothstep(fade_start, fade_end, dist);
-    color = color_grade(color);
 
     return vec4<f32>(color, fade);
 }
@@ -987,7 +1337,7 @@ struct CyclistInstanceInput {
     @location(4) scale: f32,
     @location(5) forward: vec2<f32>,
     @location(6) pedal_phase: f32,
-    @location(7) pad: f32,
+    @location(7) lean_angle: f32,
 };
 
 struct CyclistSolidOutput {
@@ -1013,15 +1363,25 @@ fn vs_cyclist(
     let local_pos = (skin_mat * vec4<f32>(in.position, 1.0)).xyz;
     let local_normal = normalize((skin_mat * vec4<f32>(in.normal, 0.0)).xyz);
 
+    // Roll (lean) around local forward axis (Z), then Y-rotation for heading
+    let cos_l = cos(inst.lean_angle);
+    let sin_l = sin(inst.lean_angle);
+    let lx = local_pos.x * cos_l - local_pos.y * sin_l;
+    let ly = local_pos.x * sin_l + local_pos.y * cos_l;
+    let lz = local_pos.z;
+    let lnx = local_normal.x * cos_l - local_normal.y * sin_l;
+    let lny = local_normal.x * sin_l + local_normal.y * cos_l;
+    let lnz = local_normal.z;
+
     // Y-axis rotation to face direction of travel
     let cos_a = inst.forward.y;
     let sin_a = inst.forward.x;
-    let rx = local_pos.x * cos_a + local_pos.z * sin_a;
-    let ry = local_pos.y;
-    let rz = -local_pos.x * sin_a + local_pos.z * cos_a;
-    let rnx = local_normal.x * cos_a + local_normal.z * sin_a;
-    let rny = local_normal.y;
-    let rnz = -local_normal.x * sin_a + local_normal.z * cos_a;
+    let rx = lx * cos_a + lz * sin_a;
+    let ry = ly;
+    let rz = -lx * sin_a + lz * cos_a;
+    let rnx = lnx * cos_a + lnz * sin_a;
+    let rny = lny;
+    let rnz = -lnx * sin_a + lnz * cos_a;
 
     let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
     out.clip_position = camera.view_proj * vec4<f32>(wp, 1.0);
@@ -1046,11 +1406,18 @@ fn vs_shadow_cyclist(
     let skin_mat = shadow_bone_matrices[instance_id * 25u + bone_id];
     let local_pos = (skin_mat * vec4<f32>(in.position, 1.0)).xyz;
 
+    // Roll (lean) then Y-rotation
+    let cos_l = cos(inst.lean_angle);
+    let sin_l = sin(inst.lean_angle);
+    let lx = local_pos.x * cos_l - local_pos.y * sin_l;
+    let ly = local_pos.x * sin_l + local_pos.y * cos_l;
+    let lz = local_pos.z;
+
     let cos_a = inst.forward.y;
     let sin_a = inst.forward.x;
-    let rx = local_pos.x * cos_a + local_pos.z * sin_a;
-    let ry = local_pos.y;
-    let rz = -local_pos.x * sin_a + local_pos.z * cos_a;
+    let rx = lx * cos_a + lz * sin_a;
+    let ry = ly;
+    let rz = -lx * sin_a + lz * cos_a;
 
     let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
     return camera.light_vp * vec4<f32>(wp, 1.0);
@@ -1068,9 +1435,25 @@ fn fs_cyclist(in: CyclistSolidOutput) -> @location(0) vec4<f32> {
     let is_bike = material.terrain_params.x > 0.5;
     if (is_bike) {
         if (bone_id == 20u) {
-            base = material.mid_color.xyz;
-        } else if (bone_id == 21u || bone_id == 22u) {
+            // Saddle: bone 20 vertices high up and behind BB — black
+            let is_saddle = in.bind_pos.y > 0.90 && in.bind_pos.z < -0.05;
+            if (is_saddle) {
+                base = vec3<f32>(0.04, 0.04, 0.05);
+            } else {
+                base = material.mid_color.xyz;
+            }
+        } else if (bone_id == 21u) {
             base = material.high_color.xyz;
+        } else if (bone_id == 22u) {
+            base = vec3<f32>(0.02, 0.02, 0.02);
+        }
+    }
+
+    // Helmet — override to yellow for head bone vertices with light base color
+    if (!is_bike && bone_id == 5u) {
+        let head_lum = dot(base, vec3<f32>(0.299, 0.587, 0.114));
+        if (head_lum > 0.7) {
+            base = vec3<f32>(1.0, 0.85, 0.0);
         }
     }
 
@@ -1083,7 +1466,7 @@ fn fs_cyclist(in: CyclistSolidOutput) -> @location(0) vec4<f32> {
     let H = normalize(L + V);
 
     var N = N_raw;
-    let detail_fade = 1.0 - smoothstep(4.0, 10.0, camera_dist);
+    let detail_fade = 1.0 - smoothstep(6.0, 25.0, camera_dist);
 
     // Bind-pose cylindrical coordinates for stable procedural textures
     let theta = atan2(in.bind_pos.x, -in.bind_pos.z);
@@ -1101,22 +1484,50 @@ fn fs_cyclist(in: CyclistSolidOutput) -> @location(0) vec4<f32> {
             let knit = sin((wu + row_offset) * 6.28318) * sin(wv * 6.28318);
 
             // Normal perturbation for fabric texture
-            let fab_nx = cos((wu + row_offset) * 6.28318) * 0.02 * detail_fade;
-            let fab_ny = cos(wv * 6.28318) * 0.01 * detail_fade;
+            let fab_nx = cos((wu + row_offset) * 6.28318) * 0.08 * detail_fade;
+            let fab_ny = cos(wv * 6.28318) * 0.04 * detail_fade;
             N = normalize(N + vec3<f32>(fab_nx, fab_ny, 0.0));
 
             // Color variation from weave structure
-            base *= 0.97 + knit * 0.05 * detail_fade;
+            base *= 0.88 + knit * 0.15 * detail_fade;
 
             // Seam lines at sides and inseam
             let side_seam = exp(-pow((abs(theta) - 1.57) / 0.04, 2.0));
             let inner_seam = exp(-pow(theta / 0.04, 2.0));
-            base *= 1.0 - (side_seam + inner_seam * 0.5) * 0.12 * detail_fade;
+            base *= 1.0 - (side_seam + inner_seam * 0.5) * 0.25 * detail_fade;
+
+            // Stitch dots along seams — periodic dark dots at ~60/m spacing
+            let stitch_freq = body_y * 60.0;
+            let stitch_dot = step(0.85, fract(stitch_freq));
+            let seam_mask = max(side_seam, inner_seam * 0.5);
+            base *= 1.0 - stitch_dot * seam_mask * 0.35 * detail_fade;
 
             // Chamois pad hint (subtle in inner shorts front)
             let chamois_y = smoothstep(0.42, 0.48, body_y) * (1.0 - smoothstep(0.58, 0.64, body_y));
             let chamois_t = exp(-pow(theta / 0.6, 2.0));
             base += vec3<f32>(0.015) * chamois_y * chamois_t * detail_fade;
+        } else if (luminance > 0.3 && luminance < 0.7) {
+            // Medium-luminance fabric (mid-range kit) — visible weave texture
+            let weave_scale = 90.0;
+            let wu = theta * weave_scale / 6.28318;
+            let wv = body_y * weave_scale;
+            let row_offset = step(0.5, fract(wv * 0.5)) * 0.5;
+            let knit = sin((wu + row_offset) * 6.28318) * sin(wv * 6.28318);
+
+            let fab_nx = cos((wu + row_offset) * 6.28318) * 0.06 * detail_fade;
+            let fab_ny = cos(wv * 6.28318) * 0.03 * detail_fade;
+            N = normalize(N + vec3<f32>(fab_nx, fab_ny, 0.0));
+
+            base *= 0.90 + knit * 0.12 * detail_fade;
+
+            // Seam lines
+            let side_seam = exp(-pow((abs(theta) - 1.57) / 0.04, 2.0));
+            base *= 1.0 - side_seam * 0.20 * detail_fade;
+
+            // Stitch dots
+            let stitch_freq = body_y * 60.0;
+            let stitch_dot = step(0.85, fract(stitch_freq));
+            base *= 1.0 - stitch_dot * side_seam * 0.30 * detail_fade;
         } else if (luminance > 0.7) {
             // Light hard surface (helmet) — glossy moulded shell
             let grain = noise2d(in.bind_pos.xz * 400.0);
@@ -1178,7 +1589,6 @@ fn fs_cyclist(in: CyclistSolidOutput) -> @location(0) vec4<f32> {
     var color = base * (light.ambient.xyz + light.color.xyz * diffuse)
               + light.color.xyz * spec + rim_color;
     color = apply_atmosphere(color, in.world_pos);
-    color = color_grade(color);
 
     return vec4<f32>(color, 1.0);
 }
@@ -1219,15 +1629,25 @@ fn vs_skin_cyclist(
     let local_pos = (skin_mat * vec4<f32>(in.position, 1.0)).xyz;
     let local_normal = normalize((skin_mat * vec4<f32>(in.normal, 0.0)).xyz);
 
+    // Roll (lean) around local forward axis (Z), then Y-rotation for heading
+    let cos_l = cos(inst.lean_angle);
+    let sin_l = sin(inst.lean_angle);
+    let lx = local_pos.x * cos_l - local_pos.y * sin_l;
+    let ly = local_pos.x * sin_l + local_pos.y * cos_l;
+    let lz = local_pos.z;
+    let lnx = local_normal.x * cos_l - local_normal.y * sin_l;
+    let lny = local_normal.x * sin_l + local_normal.y * cos_l;
+    let lnz = local_normal.z;
+
     // Y-axis rotation to face direction of travel
     let cos_a = inst.forward.y;
     let sin_a = inst.forward.x;
-    let rx = local_pos.x * cos_a + local_pos.z * sin_a;
-    let ry = local_pos.y;
-    let rz = -local_pos.x * sin_a + local_pos.z * cos_a;
-    let rnx = local_normal.x * cos_a + local_normal.z * sin_a;
-    let rny = local_normal.y;
-    let rnz = -local_normal.x * sin_a + local_normal.z * cos_a;
+    let rx = lx * cos_a + lz * sin_a;
+    let ry = ly;
+    let rz = -lx * sin_a + lz * cos_a;
+    let rnx = lnx * cos_a + lnz * sin_a;
+    let rny = lny;
+    let rnz = -lnx * sin_a + lnz * cos_a;
 
     let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
     out.clip_position = camera.view_proj * vec4<f32>(wp, 1.0);
@@ -1446,29 +1866,31 @@ fn fs_skin_cyclist(in: SkinCyclistOutput) -> @location(0) vec4<f32> {
     let freckle = smoothstep(0.72, 0.82, mottle_med);
     skin_color = mix(skin_color, skin_color * vec3<f32>(0.82, 0.72, 0.62), freckle * 0.16);
 
-    // Fine-scale: skin grain visible at close range
-    let skin_fine = noise2d(in.bind_pos.xz * 200.0);
-    skin_color *= 0.97 + skin_fine * 0.06;
+    // Fine-scale: subtle skin grain visible at close range
+    let skin_fine = noise2d(in.bind_pos.xz * 80.0);
+    let fine_fade = 1.0 - smoothstep(5.0, 12.0, camera_dist);
+    skin_color *= 0.96 + skin_fine * 0.08 * fine_fade;
 
     // ── Layer 2: Muscle normal perturbation ──
     var N = muscle_normals(in.bind_pos, N_raw, effort);
 
-    // ── Layer 2b: Skin micro-normals (pores, follicles) ──
-    let micro_fade = 1.0 - smoothstep(3.0, 8.0, camera_dist);
+    // ── Layer 2b: Skin micro-normals (pores, follicles, leg hair) ──
+    let micro_fade = 1.0 - smoothstep(5.0, 15.0, camera_dist);
     if (micro_fade > 0.01) {
         // Pore-like micro-bumps — high-frequency noise-derived normal perturbation
         let pore_p = in.bind_pos.xz * 180.0;
         let pore_dx = noise2d(pore_p + vec2<f32>(0.5, 0.0)) - noise2d(pore_p - vec2<f32>(0.5, 0.0));
         let pore_dz = noise2d(pore_p + vec2<f32>(0.0, 0.5)) - noise2d(pore_p - vec2<f32>(0.0, 0.5));
-        N = normalize(N + vec3<f32>(pore_dx, 0.0, pore_dz) * 0.04 * micro_fade);
+        N = normalize(N + vec3<f32>(pore_dx, 0.0, pore_dz) * 0.10 * micro_fade);
 
         // Hair follicle bumps on legs (below shorts line)
         if (body_y < 0.62) {
             let follicle_cell = floor(in.bind_pos.xz * 110.0);
             let follicle_hash = hash(follicle_cell);
             let follicle_active = step(0.78, follicle_hash);
-            // Slight outward normal bump where follicle is present
-            N = normalize(N + N_raw * follicle_active * 0.025 * micro_fade);
+            // Outward normal bump where follicle is present
+            N = normalize(N + N_raw * follicle_active * 0.06 * micro_fade);
+
         }
     }
 
@@ -1514,28 +1936,6 @@ fn fs_skin_cyclist(in: SkinCyclistOutput) -> @location(0) vec4<f32> {
         sweat_spec *= 1.0 - smoothstep(4.0, 8.0, camera_dist);
     }
 
-    // ── Layer 8: Vein hint (more prominent, distance-faded) ──
-    var vein_tint = vec3<f32>(0.0);
-    if (camera_dist < 12.0 && body_y > 0.12 && body_y < 0.60) {
-        // Use bind_pos for stable vein pattern
-        let vein_noise = fbm_n(in.bind_pos.xz * 35.0, 3);
-        let vein_mask = smoothstep(0.50, 0.62, vein_noise);
-        // Branch-like secondary veins
-        let vein_branch = fbm_n(in.bind_pos.xz * 70.0 + vec2<f32>(17.0, 31.0), 2);
-        let branch_mask = smoothstep(0.55, 0.68, vein_branch) * 0.5;
-        let combined_vein = max(vein_mask, branch_mask);
-        // Visible on inner leg, front of quad, and calf
-        let inner_mask = exp(-pow((theta - 1.0) / 0.6, 2.0));
-        let front_mask = exp(-pow(theta / 0.5, 2.0));
-        let calf_outer = exp(-pow((theta + 1.2) / 0.4, 2.0));
-        let region = max(max(inner_mask, front_mask * 0.6), calf_outer * 0.4);
-        let prominence = 0.35 + effort * 0.55;
-        let vein_intensity = combined_vein * region * prominence;
-        let vein_fade = 1.0 - smoothstep(6.0, 12.0, camera_dist);
-        let vein_color = vec3<f32>(0.28, 0.32, 0.52);
-        vein_tint = (vein_color - skin_color) * vein_intensity * vein_fade * 0.30;
-    }
-
     // ── Shadow ──
     let shadow = shadow_factor_biased(in.shadow_pos, N_raw);
 
@@ -1545,12 +1945,8 @@ fn fs_skin_cyclist(in: SkinCyclistOutput) -> @location(0) vec4<f32> {
               + translucency * shadow * skin_color
               + sweat_spec * shadow * light.color.xyz;
 
-    // Apply vein tint to final color
-    color += vein_tint;
-
-    // Atmosphere + grading
+    // Atmosphere
     color = apply_atmosphere(color, in.world_pos);
-    color = color_grade(color);
 
     return vec4<f32>(color, 1.0);
 }
@@ -1567,6 +1963,7 @@ struct TexturedCyclistOutput {
     @location(2) uv: vec2<f32>,
     @location(3) shadow_pos: vec3<f32>,
     @location(4) tex_uv: vec2<f32>,
+    @location(5) bind_pos: vec3<f32>,
 };
 
 @vertex
@@ -1580,18 +1977,79 @@ fn vs_textured_cyclist(
     // Bone skinning (same as vs_cyclist)
     let bone_id = u32(round(in.uv.x));
     let skin_mat = bone_matrices[instance_id * 25u + bone_id];
-    let local_pos = (skin_mat * vec4<f32>(in.position, 1.0)).xyz;
+
+    // Back pocket displacement — items stuffed in 3 pockets
+    let TAU = 6.28318530718;
+    let bp_theta = atan2(in.position.x, -in.position.z); // -PI..PI, 0=front
+    let body_y = in.position.y;
+
+    // Pocket zone: back-facing, lower torso
+    let pocket_y_center = 0.75;
+    let pocket_y_half = 0.08;
+    let pocket_y_mask = 1.0 - smoothstep(0.0, 1.0, abs(body_y - pocket_y_center) / pocket_y_half);
+    let back_amount = smoothstep(1.8, 2.3, abs(bp_theta));
+    let pocket_mask = pocket_y_mask * back_amount;
+
+    // Per-pocket item lumps — each pocket has different stuff in it
+    let theta_abs = abs(bp_theta);
+
+    // Left pocket (theta ~ 2.3–2.65): energy gels — two small round lumps
+    let lp_theta = smoothstep(2.25, 2.40, theta_abs) * (1.0 - smoothstep(2.55, 2.65, theta_abs));
+    let gel1_y = exp(-pow((body_y - 0.73) / 0.02, 2.0));
+    let gel2_y = exp(-pow((body_y - 0.77) / 0.02, 2.0));
+    let left_lump = lp_theta * max(gel1_y, gel2_y) * 0.025;
+
+    // Center pocket (theta ~ 2.7–3.1): phone — one big rectangular bulge
+    let cp_theta = smoothstep(2.68, 2.80, theta_abs) * (1.0 - smoothstep(3.00, 3.10, theta_abs));
+    let phone_y = smoothstep(0.69, 0.72, body_y) * (1.0 - smoothstep(0.79, 0.82, body_y));
+    let center_lump = cp_theta * phone_y * 0.035;
+
+    // Right pocket (theta on the other side, mirrored via abs): food wrapper — irregular
+    // Since we use abs(theta), right pocket mirrors left. Use sign to differentiate.
+    let rp_side = step(0.0, bp_theta); // 1 for positive theta side
+    let rp_theta = smoothstep(2.25, 2.40, theta_abs) * (1.0 - smoothstep(2.55, 2.65, theta_abs));
+    let bar_y = exp(-pow((body_y - 0.74) / 0.03, 2.0));
+    let right_lump = rp_theta * rp_side * bar_y * 0.020;
+    // Left side gets the gels
+    let left_side_lump = lp_theta * (1.0 - rp_side) * max(gel1_y, gel2_y) * 0.025;
+
+    let item_bulge = left_side_lump + center_lump + right_lump;
+
+    // Subtle bounce from pedaling on top of static bulge
+    let time = camera.eye_pos.w;
+    let phase = inst.pedal_phase;
+    let bounce = sin(phase * TAU + time * 4.0) * 0.15 + 1.0;
+
+    // Combined: permanent item bulge + overall pocket sag + bounce
+    let pocket_bulge = pocket_mask * 0.012 + item_bulge * bounce;
+
+    // Gravity sag — items pull the pocket bottom down slightly
+    let sag_y = smoothstep(0.70, 0.68, body_y) * back_amount * 0.008;
+
+    var displaced_pos = in.position + in.normal * pocket_bulge + vec3<f32>(0.0, -sag_y, 0.0);
+
+    let local_pos = (skin_mat * vec4<f32>(displaced_pos, 1.0)).xyz;
     let local_normal = normalize((skin_mat * vec4<f32>(in.normal, 0.0)).xyz);
+
+    // Roll (lean) around local forward axis (Z), then Y-rotation for heading
+    let cos_l = cos(inst.lean_angle);
+    let sin_l = sin(inst.lean_angle);
+    let lx = local_pos.x * cos_l - local_pos.y * sin_l;
+    let ly = local_pos.x * sin_l + local_pos.y * cos_l;
+    let lz = local_pos.z;
+    let lnx = local_normal.x * cos_l - local_normal.y * sin_l;
+    let lny = local_normal.x * sin_l + local_normal.y * cos_l;
+    let lnz = local_normal.z;
 
     // Y-axis rotation to face direction of travel
     let cos_a = inst.forward.y;
     let sin_a = inst.forward.x;
-    let rx = local_pos.x * cos_a + local_pos.z * sin_a;
-    let ry = local_pos.y;
-    let rz = -local_pos.x * sin_a + local_pos.z * cos_a;
-    let rnx = local_normal.x * cos_a + local_normal.z * sin_a;
-    let rny = local_normal.y;
-    let rnz = -local_normal.x * sin_a + local_normal.z * cos_a;
+    let rx = lx * cos_a + lz * sin_a;
+    let ry = ly;
+    let rz = -lx * sin_a + lz * cos_a;
+    let rnx = lnx * cos_a + lnz * sin_a;
+    let rny = lny;
+    let rnz = -lnx * sin_a + lnz * cos_a;
 
     let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
     out.clip_position = camera.view_proj * vec4<f32>(wp, 1.0);
@@ -1599,9 +2057,9 @@ fn vs_textured_cyclist(
     out.world_normal = vec3<f32>(rnx, rny, rnz);
     out.uv = in.uv;
     out.shadow_pos = world_to_shadow(wp);
+    out.bind_pos = in.position;
 
     // Procedural cylindrical UV from bind-pose (pre-skinned) position
-    let TAU = 6.28318530718;
     let tex_u = atan2(in.position.x, -in.position.z) / TAU + 0.5;
     let tex_v = (in.position.y - 0.65) / 0.45;
     out.tex_uv = vec2<f32>(tex_u, tex_v);
@@ -1612,7 +2070,7 @@ fn vs_textured_cyclist(
 @fragment
 fn fs_textured_cyclist(in: TexturedCyclistOutput) -> @location(0) vec4<f32> {
     let camera_dist = length(camera.eye_pos.xyz - in.world_pos);
-    let detail_fade = 1.0 - smoothstep(4.0, 10.0, camera_dist);
+    let detail_fade = 1.0 - smoothstep(6.0, 25.0, camera_dist);
 
     // Sample jersey texture and tint
     let tex_color = textureSample(base_tex, base_samp, in.tex_uv);
@@ -1634,19 +2092,94 @@ fn fs_textured_cyclist(in: TexturedCyclistOutput) -> @location(0) vec4<f32> {
     let weave = knit_u * knit_v;
 
     // Normal perturbation from fabric weave
-    let fab_nx = cos((wu + row_shift) * 6.28318) * 0.02 * detail_fade;
-    let fab_nz = cos(wv * 6.28318) * 0.015 * detail_fade;
+    let fab_nx = cos((wu + row_shift) * 6.28318) * 0.08 * detail_fade;
+    let fab_nz = cos(wv * 6.28318) * 0.04 * detail_fade;
     N = normalize(N + vec3<f32>(fab_nx, 0.0, fab_nz));
 
     // Fabric color variation from weave structure
-    base *= 0.97 + weave * 0.05 * detail_fade;
+    base *= 0.88 + weave * 0.15 * detail_fade;
 
     // Seam lines — shoulder seams, side seams
     let shoulder_seam = exp(-pow((in.tex_uv.y - 0.85) / 0.02, 2.0));
     let side_seam_l = exp(-pow(in.tex_uv.x / 0.03, 2.0));
     let side_seam_r = exp(-pow((in.tex_uv.x - 1.0) / 0.03, 2.0));
     let seam = max(shoulder_seam, max(side_seam_l, side_seam_r));
-    base *= 1.0 - seam * 0.10 * detail_fade;
+    base *= 1.0 - seam * 0.25 * detail_fade;
+
+    // Stitch dots along seams — periodic dark dots at ~60/m spacing
+    let stitch_freq_t = in.bind_pos.y * 60.0;
+    let stitch_dot_t = step(0.85, fract(stitch_freq_t));
+    base *= 1.0 - stitch_dot_t * seam * 0.35 * detail_fade;
+
+    // Back pocket details — 3 pockets stuffed with items
+    let bp_theta = atan2(in.bind_pos.x, -in.bind_pos.z);
+    let bp_y = in.bind_pos.y;
+    let bp_theta_abs = abs(bp_theta);
+    let is_back = smoothstep(1.8, 2.3, bp_theta_abs);
+    let pocket_zone_y = 1.0 - smoothstep(0.0, 1.0, abs(bp_y - 0.75) / 0.08);
+    let in_pocket = is_back * pocket_zone_y;
+
+    if (in_pocket > 0.01) {
+        // Pocket opening seam (top edge) — darker stitch line with elastic gather
+        let pocket_top_seam = exp(-pow((bp_y - 0.82) / 0.004, 2.0)) * is_back;
+        base *= 1.0 - pocket_top_seam * 0.20 * detail_fade;
+
+        // Elastic gather ripple at opening
+        let gather = sin(bp_theta * 40.0) * 0.5 + 0.5;
+        let gather_line = exp(-pow((bp_y - 0.82) / 0.008, 2.0)) * is_back;
+        base *= 1.0 - gather * gather_line * 0.08 * detail_fade;
+
+        // Vertical divider seams between 3 pockets
+        let divider1 = exp(-pow((bp_theta_abs - 2.65) / 0.025, 2.0));
+        let divider2 = exp(-pow((bp_theta_abs - 3.10) / 0.025, 2.0));
+        let pocket_dividers = max(divider1, divider2) * pocket_zone_y;
+        base *= 1.0 - pocket_dividers * 0.18 * detail_fade;
+
+        // Item outlines visible through stretched fabric
+        let bp_side = step(0.0, bp_theta);
+
+        // Left pocket: energy gel outlines (two bumps)
+        let lp_mask = smoothstep(2.25, 2.40, bp_theta_abs) * (1.0 - smoothstep(2.55, 2.65, bp_theta_abs));
+        let gel1 = exp(-pow((bp_y - 0.73) / 0.015, 2.0)) * lp_mask * (1.0 - bp_side);
+        let gel2 = exp(-pow((bp_y - 0.77) / 0.015, 2.0)) * lp_mask * (1.0 - bp_side);
+        let gel_outline = max(gel1, gel2);
+        // Fabric stretches lighter over item tops, darker in creases around them
+        base *= 1.0 + gel_outline * 0.06 * detail_fade;
+        let gel_edge1 = exp(-pow((bp_y - 0.71) / 0.006, 2.0)) * lp_mask * (1.0 - bp_side);
+        let gel_edge2 = exp(-pow((bp_y - 0.79) / 0.006, 2.0)) * lp_mask * (1.0 - bp_side);
+        base *= 1.0 - max(gel_edge1, gel_edge2) * 0.10 * detail_fade;
+
+        // Center pocket: phone rectangle outline
+        let cp_mask = smoothstep(2.68, 2.80, bp_theta_abs) * (1.0 - smoothstep(3.00, 3.10, bp_theta_abs));
+        let phone_top = exp(-pow((bp_y - 0.80) / 0.005, 2.0)) * cp_mask;
+        let phone_bottom = exp(-pow((bp_y - 0.70) / 0.005, 2.0)) * cp_mask;
+        let phone_body = smoothstep(0.70, 0.72, bp_y) * (1.0 - smoothstep(0.79, 0.80, bp_y)) * cp_mask;
+        // Phone makes fabric taut and slightly shinier in center
+        base *= 1.0 + phone_body * 0.04 * detail_fade;
+        // Phone edges create crease shadows
+        base *= 1.0 - (phone_top + phone_bottom) * 0.12 * detail_fade;
+        // Vertical phone edges
+        let phone_left_e = exp(-pow((bp_theta_abs - 2.72) / 0.02, 2.0)) * pocket_zone_y;
+        let phone_right_e = exp(-pow((bp_theta_abs - 3.06) / 0.02, 2.0)) * pocket_zone_y;
+        base *= 1.0 - max(phone_left_e, phone_right_e) * 0.08 * detail_fade;
+
+        // Right pocket: food bar — wider lump
+        let rp_mask = smoothstep(2.25, 2.40, bp_theta_abs) * (1.0 - smoothstep(2.55, 2.65, bp_theta_abs));
+        let bar_outline = exp(-pow((bp_y - 0.74) / 0.025, 2.0)) * rp_mask * bp_side;
+        base *= 1.0 + bar_outline * 0.05 * detail_fade;
+        let bar_edge = exp(-pow((bp_y - 0.71) / 0.006, 2.0)) * rp_mask * bp_side;
+        base *= 1.0 - bar_edge * 0.08 * detail_fade;
+
+        // Pocket bottom shadow — fabric sags under weight
+        let pocket_bottom_shadow = exp(-pow((bp_y - 0.67) / 0.010, 2.0)) * is_back;
+        base *= 1.0 - pocket_bottom_shadow * 0.12 * detail_fade;
+
+        // Fabric tension wrinkles radiating from heavy items
+        let wrinkle_freq = bp_theta * 25.0 + bp_y * 40.0;
+        let wrinkles = sin(wrinkle_freq) * 0.5 + 0.5;
+        let wrinkle_zone = in_pocket * smoothstep(0.69, 0.73, bp_y) * (1.0 - smoothstep(0.78, 0.82, bp_y));
+        base *= 1.0 - wrinkles * wrinkle_zone * 0.04 * detail_fade;
+    }
 
     // Subtle fabric wear/pilling variation
     let wear = fbm_n(in.tex_uv * 15.0, 2);
@@ -1671,7 +2204,6 @@ fn fs_textured_cyclist(in: TexturedCyclistOutput) -> @location(0) vec4<f32> {
     var color = base * (light.ambient.xyz + light.color.xyz * diffuse)
               + light.color.xyz * spec + rim_color;
     color = apply_atmosphere(color, in.world_pos);
-    color = color_grade(color);
 
     return vec4<f32>(color, 1.0);
 }
@@ -1797,17 +2329,16 @@ fn fs_textured(in: VertexOutput) -> @location(0) vec4<f32> {
     let direct = shadow * (diff * sun_warm * final_base + spec * sun_warm * 0.06);
     var color = ambient + direct + sss * shadow + bounce_color;
 
+    // Volumetric light shafts
+    color += volumetric_light(in.world_pos);
+
     // Fog
     color = apply_atmosphere(color, in.world_pos);
-
-    // Tone mapping
-    color = color / (color + vec3<f32>(1.0));
 
     // Discard fully transparent texels (alpha cutout for foliage cards)
     if (tex_color.a < 0.1) {
         discard;
     }
-    color = color_grade(color);
 
     return vec4<f32>(color, 1.0);
 }
@@ -1903,8 +2434,6 @@ fn fs_water(in: VertexOutput) -> @location(0) vec4<f32> {
     // Atmospheric perspective
     color = apply_atmosphere(color, in.world_pos);
 
-    color = color_grade(color);
-
     // Opaque water — no transparency
     return vec4<f32>(color, 1.0);
 }
@@ -1916,8 +2445,194 @@ fn fs_emissive(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = material.base_color.xyz;
     // Fog only, no lighting
     color = apply_atmosphere(color, in.world_pos);
-    color = color_grade(color);
     return vec4<f32>(color, 1.0);
+}
+
+// ── Fullscreen vertex shader (sky, post-process, bloom) ─────────
+//
+// Generates a fullscreen triangle from vertex index alone (no vertex buffer).
+// Vertex 0: (-1,-1), Vertex 1: (3,-1), Vertex 2: (-1,3)
+// UV coords: (0,1), (2,1), (0,-1) — flipped Y for texture sampling
+
+struct FullscreenOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> FullscreenOutput {
+    var out: FullscreenOutput;
+    let uv = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 1.0, 1.0);
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+// ── Procedural sky ──────────────────────────────────────────────
+//
+// Bind group 0 for sky pass: sky uniforms only
+// (separate pipeline layout from main pass)
+
+struct SkyUniforms {
+    inv_view_proj: mat4x4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color: vec4<f32>,
+    sky_zenith: vec4<f32>,    // .w = cloud_coverage
+    sky_horizon: vec4<f32>,   // .w = haze_density
+};
+
+@group(0) @binding(0) var<uniform> sky: SkyUniforms;
+
+@fragment
+fn fs_sky(in: FullscreenOutput) -> @location(0) vec4<f32> {
+    // Reconstruct view direction from screen UV via inverse view-projection
+    let ndc = vec4<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0, 1.0, 1.0);
+    let world_pos = sky.inv_view_proj * ndc;
+    let view_dir = normalize(world_pos.xyz / world_pos.w);
+
+    let sun_dir = normalize(sky.sun_direction.xyz);
+    let sun_dot = dot(view_dir, sun_dir);
+    let y = view_dir.y;
+
+    // Vertical gradient: zenith → horizon
+    let horizon_t = smoothstep(-0.02, 0.3, y);
+    var color = mix(sky.sky_horizon.xyz, sky.sky_zenith.xyz, horizon_t);
+
+    // Below horizon: fade to ground color
+    let ground_color = sky.sky_horizon.xyz * 0.5;
+    let ground_t = smoothstep(0.0, -0.05, y);
+    color = mix(color, ground_color, ground_t);
+
+    // Sun disc — bright, HDR
+    let sun_disc = smoothstep(0.9995, 0.9999, sun_dot) * 50.0;
+    color += sky.sun_color.xyz * sun_disc;
+
+    // Sun glow — broad warm halo
+    let sun_glow = pow(max(sun_dot, 0.0), 8.0) * 0.4;
+    color += sky.sun_color.xyz * sun_glow;
+
+    // Mie scattering — forward scatter around sun
+    let mie = pow(max(sun_dot, 0.0), 64.0) * 0.8;
+    color += sky.sun_color.xyz * mie;
+
+    // Horizon haze
+    let haze = sky.sky_horizon.w;
+    let haze_t = 1.0 - smoothstep(0.0, 0.15, abs(y));
+    color = mix(color, sky.sky_horizon.xyz * 1.2, haze_t * haze);
+
+    // Procedural clouds — FBM projected onto y=1 plane
+    let cloud_coverage = sky.sky_zenith.w;
+    if (y > 0.02 && cloud_coverage > 0.01) {
+        let cloud_scale = 0.0004;
+        let cloud_uv = view_dir.xz / max(view_dir.y, 0.05) * cloud_scale;
+        let cloud_noise = fbm(cloud_uv * 800.0);
+        let cloud_shape = smoothstep(0.4 - cloud_coverage * 0.3, 0.6, cloud_noise);
+        // Horizon fade — clouds thin out near horizon
+        let cloud_horizon_fade = smoothstep(0.02, 0.15, y);
+        let cloud_alpha = cloud_shape * cloud_horizon_fade * 0.8;
+        // Cloud lit by sun — brighter on sun-facing side
+        let cloud_bright = 0.9 + max(sun_dot, 0.0) * 0.3;
+        let cloud_color = vec3<f32>(cloud_bright);
+        color = mix(color, cloud_color, cloud_alpha);
+    }
+
+    return vec4<f32>(color, 1.0);
+}
+
+// ── Post-processing ─────────────────────────────────────────────
+//
+// Reads HDR scene texture + bloom texture, applies tone mapping, vignette, color grading.
+// Bind group: [uniforms, scene_texture, scene_sampler, bloom_texture, bloom_sampler]
+
+struct PostProcessUniforms {
+    exposure: f32,
+    bloom_intensity: f32,
+    vignette_intensity: f32,
+    saturation: f32,
+    color_temperature: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+
+@group(0) @binding(0) var<uniform> post: PostProcessUniforms;
+@group(0) @binding(1) var scene_tex: texture_2d<f32>;
+@group(0) @binding(2) var scene_samp: sampler;
+@group(0) @binding(3) var bloom_tex: texture_2d<f32>;
+@group(0) @binding(4) var bloom_samp: sampler;
+
+@fragment
+fn fs_post_process(in: FullscreenOutput) -> @location(0) vec4<f32> {
+    var color = textureSample(scene_tex, scene_samp, in.uv).xyz;
+    let bloom = textureSample(bloom_tex, bloom_samp, in.uv).xyz;
+
+    // Apply bloom
+    color += bloom * post.bloom_intensity;
+
+    // Exposure
+    color *= post.exposure;
+
+    // ACES filmic tone mapping (Narkowicz approximation)
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3(0.0), vec3(1.0));
+
+    // Warm shift
+    color = color * vec3<f32>(1.025, 1.0, 0.96);
+
+    // Saturation adjustment
+    let lum = dot(color, vec3<f32>(0.299, 0.587, 0.114));
+    color = mix(vec3(lum), color, post.saturation);
+
+    // Vignette
+    let center = in.uv - 0.5;
+    let vignette = 1.0 - dot(center, center) * post.vignette_intensity * 4.0;
+    color *= clamp(vignette, 0.0, 1.0);
+
+    return vec4<f32>(clamp(color, vec3(0.0), vec3(1.0)), 1.0);
+}
+
+// ── Bloom passes ────────────────────────────────────────────────
+//
+// Pass A: Brightness extract + downsample (reads HDR scene, outputs half-res)
+// Pass B: Horizontal gaussian blur
+// Pass C: Vertical gaussian blur
+
+struct BloomUniforms {
+    texel_size: vec2<f32>,
+    direction: vec2<f32>,
+};
+
+@group(0) @binding(0) var<uniform> bloom: BloomUniforms;
+@group(0) @binding(1) var bloom_input_tex: texture_2d<f32>;
+@group(0) @binding(2) var bloom_input_samp: sampler;
+
+@fragment
+fn fs_bloom_extract(in: FullscreenOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(bloom_input_tex, bloom_input_samp, in.uv).xyz;
+    let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Soft threshold at 1.0 — smoothly extract bright areas
+    let contribution = max(luminance - 1.0, 0.0) / max(luminance, 0.001);
+    return vec4<f32>(color * contribution, 1.0);
+}
+
+@fragment
+fn fs_bloom_blur(in: FullscreenOutput) -> @location(0) vec4<f32> {
+    // 9-tap gaussian blur along bloom.direction
+    let weights = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+    let offset = bloom.texel_size * bloom.direction;
+
+    var result = textureSample(bloom_input_tex, bloom_input_samp, in.uv).xyz * weights[0];
+    for (var i = 1; i < 5; i++) {
+        let off = offset * f32(i);
+        result += textureSample(bloom_input_tex, bloom_input_samp, in.uv + off).xyz * weights[i];
+        result += textureSample(bloom_input_tex, bloom_input_samp, in.uv - off).xyz * weights[i];
+    }
+
+    return vec4<f32>(result, 1.0);
 }
 
 // ── HUD vertex + fragment shaders ───────────────────────────────

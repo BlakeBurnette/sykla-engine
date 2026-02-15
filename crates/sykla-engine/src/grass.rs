@@ -29,7 +29,7 @@ impl GrassParams {
             // Piedmont — lush maintained grass
             Self {
                 num_shells,
-                shell_height: 0.35,
+                shell_height: 0.50,
                 color_base: [0.20, 0.35, 0.10],
                 color_tip: [0.40, 0.55, 0.20],
                 density: 0.7,
@@ -42,7 +42,7 @@ impl GrassParams {
             // Alpine — hardy mountain meadow
             Self {
                 num_shells,
-                shell_height: 0.40,
+                shell_height: 0.55,
                 color_base: [0.18, 0.32, 0.08],
                 color_tip: [0.35, 0.50, 0.18],
                 density: 0.5,
@@ -55,7 +55,7 @@ impl GrassParams {
             // Coastal — salt-tolerant grass
             Self {
                 num_shells,
-                shell_height: 0.45,
+                shell_height: 0.60,
                 color_base: [0.25, 0.38, 0.12],
                 color_tip: [0.50, 0.60, 0.28],
                 density: 0.6,
@@ -68,7 +68,7 @@ impl GrassParams {
             // Forest — shade-tolerant understory
             Self {
                 num_shells,
-                shell_height: 0.25,
+                shell_height: 0.40,
                 color_base: [0.16, 0.28, 0.08],
                 color_tip: [0.28, 0.42, 0.14],
                 density: 0.5,

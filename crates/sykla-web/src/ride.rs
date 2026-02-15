@@ -1,39 +1,33 @@
 use sykla_core::ride_engine::RideEngine;
 use sykla_core::types::Route;
 
-use crate::ble::{TrainerCommand, TrainerState};
+use crate::ble::BleState;
 
-/// Active ride state — plain struct, no Bevy.
+/// Active ride state — plain struct wrapping RideEngine.
 pub struct ActiveRide {
     pub engine: RideEngine,
-    pub command: TrainerCommand,
 }
 
 impl ActiveRide {
     pub fn new(route: Route) -> Self {
         Self {
             engine: RideEngine::new(route),
-            command: TrainerCommand::default(),
         }
     }
 
-    /// Update ride simulation. Returns current grade.
-    pub fn update(&mut self, dt: f64, trainer: &TrainerState) -> f64 {
+    /// Update ride simulation and send grade to trainer. Returns current grade.
+    pub fn update(&mut self, dt: f64, ble: &mut BleState, t: f32, crr: f64, cda: f64) -> f64 {
         let grade = self.engine.update(
             dt,
-            trainer.speed_kmh,
-            trainer.power_watts,
-            trainer.cadence_rpm,
+            ble.speed_kmh,
+            ble.power_watts,
+            ble.cadence_rpm,
         );
 
-        self.command.params.grade_percent = grade;
-        self.command.dirty = true;
+        // Send grade to trainer at ~1Hz
+        let now_ms = (t * 1000.0) as f64;
+        ble.send_sim_params(grade, now_ms, crr, cda);
 
         grade
-    }
-
-    /// Flush pending trainer commands.
-    pub fn flush_commands(&mut self) {
-        self.command.flush();
     }
 }

@@ -323,6 +323,66 @@ pub fn generate_goose() -> CpuMesh {
     CpuMesh { vertices, indices }
 }
 
+/// Turkey: plump ground bird with fan tail, short neck, wattle (~300 tris)
+pub fn generate_turkey() -> CpuMesh {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Plump round body — exaggerated for cuteness
+    add_ellipsoid(&mut vertices, &mut indices, 0.0, 0.35, 0.0, 0.18, 0.20, 0.22, 6, 10);
+
+    // Short thick neck angled up
+    add_cylinder(
+        &mut vertices, &mut indices,
+        [0.0, 0.50, 0.18], 0.06,
+        [0.0, 0.62, 0.24], 0.04,
+        6,
+    );
+
+    // Small round head
+    add_ellipsoid(&mut vertices, &mut indices, 0.0, 0.66, 0.26, 0.035, 0.035, 0.04, 4, 6);
+
+    // Red wattle (small ellipsoid hanging under beak)
+    add_ellipsoid(&mut vertices, &mut indices, 0.0, 0.60, 0.30, 0.012, 0.025, 0.010, 3, 5);
+
+    // Beak
+    add_cylinder(&mut vertices, &mut indices, [0.0, 0.66, 0.30], 0.010, [0.0, 0.65, 0.36], 0.003, 4);
+
+    // 2 thick legs
+    add_cylinder(&mut vertices, &mut indices, [0.06, 0.0, 0.0], 0.025, [0.06, 0.20, 0.0], 0.020, 5);
+    add_cylinder(&mut vertices, &mut indices, [-0.06, 0.0, 0.0], 0.025, [-0.06, 0.20, 0.0], 0.020, 5);
+
+    // Fan tail — 7 flat triangles radiating from rear, angled up ~60°
+    let tail_base = [0.0f32, 0.40, -0.20];
+    let tail_len = 0.28;
+    let fan_half = 7;
+    for i in 0..fan_half {
+        let t = i as f32 / (fan_half - 1) as f32; // 0..1
+        let angle = (t - 0.5) * 1.2; // spread ~70 degrees total
+        let up_angle: f32 = 1.05; // ~60 degrees up from horizontal
+        let dx = angle.sin() * tail_len;
+        let dy = up_angle.sin() * tail_len;
+        let dz = -up_angle.cos() * tail_len * angle.cos();
+
+        let tip = [tail_base[0] + dx, tail_base[1] + dy, tail_base[2] + dz];
+        // Each feather is a thin triangle
+        let side_offset = 0.015;
+        let tb = vertices.len() as u32;
+        let nx = -angle.sin();
+        let nz = angle.cos();
+        vertices.push(Vertex { position: tail_base, normal: [nx, 0.3, nz], uv: [0.5, 0.0] });
+        vertices.push(Vertex { position: tip, normal: [nx, 0.3, nz], uv: [0.5, 1.0] });
+        vertices.push(Vertex {
+            position: [tail_base[0] + side_offset * (1.0 - t * 2.0), tail_base[1] + 0.02, tail_base[2] - 0.02],
+            normal: [nx, 0.3, nz],
+            uv: [1.0, 0.0],
+        });
+        indices.extend_from_slice(&[tb, tb + 1, tb + 2]);
+    }
+
+    CpuMesh { vertices, indices }
+}
+
 // ════════════════════════════════════════════════════════════════
 // Placement
 // ════════════════════════════════════════════════════════════════
@@ -331,6 +391,7 @@ pub struct WildlifePlacement {
     // Ground animals (static, use InstanceData)
     pub squirrels: Vec<InstanceData>,
     pub deer: Vec<InstanceData>,
+    pub turkeys: Vec<InstanceData>,
     pub turtles: Vec<InstanceData>,
     pub egrets: Vec<InstanceData>,
     // Flying animals (animated, use AnimatedInstanceData)
@@ -362,6 +423,7 @@ pub fn place_wildlife(
 
     let mut squirrels = Vec::new();
     let mut deer = Vec::new();
+    let mut turkeys = Vec::new();
     let mut turtles = Vec::new();
     let mut egrets = Vec::new();
     let mut crows = Vec::new();
@@ -371,16 +433,16 @@ pub fn place_wildlife(
 
     // ── Ground animals ──
 
-    // Squirrels: every 20m slot, 0-3 per slot
+    // Squirrels: every 15m slot, 0-4 per slot
     {
-        let slot_spacing = 20.0;
+        let slot_spacing = 15.0;
         let n = (total_dist / slot_spacing) as usize;
         for slot in 0..n {
             let base_dist = slot as f32 * slot_spacing;
             let prox_idx = (base_dist / 10.0) as usize;
             let near_water = prox_idx < water_proximity.len()
                 && water_proximity[prox_idx] < 30.0;
-            let max_count = if near_water { 3 } else { 2 };
+            let max_count = if near_water { 4 } else { 3 };
             let count = (next_rng(&mut rng) * (max_count as f32 + 1.0)) as usize;
 
             for _ in 0..count {
@@ -391,25 +453,25 @@ pub fn place_wildlife(
                 let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
                 let (wx, wz) = offset_position(px, pz, fx, fz, lateral);
                 let y = if let Some(d) = dem { d.sample_at(gx, gz, fx, fz, lateral).unwrap_or(y) } else { y };
-                let scale = 0.8 + next_rng(&mut rng) * 0.4;
+                let scale = 1.0 + next_rng(&mut rng) * 0.5;
                 squirrels.push(InstanceData { position: [wx, y, wz], scale });
             }
         }
     }
 
-    // Deer: every 100m, 30% chance of group (2-5)
+    // Deer: every 100m, 45% chance of group (3-6)
     {
         let slot_spacing = 100.0;
         let n = (total_dist / slot_spacing) as usize;
         for slot in 0..n {
             let base_dist = slot as f32 * slot_spacing;
-            if next_rng(&mut rng) > 0.30 { continue; }
+            if next_rng(&mut rng) > 0.45 { continue; }
 
             let prox_idx = (base_dist / 10.0) as usize;
             let near_water = prox_idx < water_proximity.len()
                 && water_proximity[prox_idx] < 40.0;
 
-            let group_size = 2 + (next_rng(&mut rng) * 4.0) as usize;
+            let group_size = 3 + (next_rng(&mut rng) * 4.0) as usize;
             let extra = if near_water { 1 + (next_rng(&mut rng) * 2.0) as usize } else { 0 };
 
             let side = if next_rng(&mut rng) > 0.5 { 1.0 } else { -1.0 };
@@ -421,9 +483,33 @@ pub fn place_wildlife(
                 let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
                 let (wx, wz) = offset_position(px, pz, fx, fz, lateral);
                 let y = if let Some(d) = dem { d.sample_at(gx, gz, fx, fz, lateral).unwrap_or(y) } else { y };
-                let scale = 0.85 + next_rng(&mut rng) * 0.30;
+                let scale = 0.9 + next_rng(&mut rng) * 0.40;
                 let scale = if near_water && i >= group_size { scale * 0.9 } else { scale };
                 deer.push(InstanceData { position: [wx, y, wz], scale });
+            }
+        }
+    }
+
+    // Turkeys: every 120m, 25% chance of group (2-4)
+    {
+        let slot_spacing = 120.0;
+        let n = (total_dist / slot_spacing) as usize;
+        for slot in 0..n {
+            let base_dist = slot as f32 * slot_spacing;
+            if next_rng(&mut rng) > 0.25 { continue; }
+
+            let group_size = 2 + (next_rng(&mut rng) * 3.0) as usize;
+            let side = if next_rng(&mut rng) > 0.5 { 1.0 } else { -1.0 };
+            let base_lateral = side * (8.0 + next_rng(&mut rng) * 27.0);
+
+            for _ in 0..group_size {
+                let lateral = base_lateral + (next_rng(&mut rng) - 0.5) * 8.0;
+                let dist_along = (base_dist + (next_rng(&mut rng) - 0.5) * 15.0) as f64;
+                let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
+                let (wx, wz) = offset_position(px, pz, fx, fz, lateral);
+                let y = if let Some(d) = dem { d.sample_at(gx, gz, fx, fz, lateral).unwrap_or(y) } else { y };
+                let scale = 0.9 + next_rng(&mut rng) * 0.3;
+                turkeys.push(InstanceData { position: [wx, y, wz], scale });
             }
         }
     }
@@ -459,11 +545,11 @@ pub fn place_wildlife(
     // Flying animals use world-space positions. We compute initial world positions
     // from route distance + lateral offset, then they fly freely in world space.
 
-    // Crows: 1 per ~200m
+    // Crows: 1 per ~120m
     {
-        let n = (total_dist / 200.0) as usize;
+        let n = (total_dist / 120.0) as usize;
         for i in 0..n {
-            let dist_along = i as f32 * 200.0 + next_rng(&mut rng) * 100.0;
+            let dist_along = i as f32 * 120.0 + next_rng(&mut rng) * 60.0;
             let lateral = (next_rng(&mut rng) - 0.5) * 60.0;
             let (px, pz, base_elev, fx, fz) = interpolate_point(points, dist_along as f64);
             let (wx, wz) = offset_position(px, pz, fx, fz, lateral);
@@ -480,9 +566,9 @@ pub fn place_wildlife(
         }
     }
 
-    // Hawks/vultures: 2-4 total, high altitude, slow
+    // Hawks/vultures: 3-6 total, high altitude, slow
     {
-        let count = 2 + (next_rng(&mut rng) * 3.0) as usize;
+        let count = 3 + (next_rng(&mut rng) * 4.0) as usize;
         for _ in 0..count {
             let dist_along = next_rng(&mut rng) * total_dist;
             let lateral = (next_rng(&mut rng) - 0.5) * 80.0;
@@ -500,9 +586,9 @@ pub fn place_wildlife(
         }
     }
 
-    // Starling flocks: 2-5 flocks of 20-50 birds each
+    // Starling flocks: 3-7 flocks of 25-60 birds each
     {
-        let num_flocks = 2 + (next_rng(&mut rng) * 4.0) as usize;
+        let num_flocks = 3 + (next_rng(&mut rng) * 5.0) as usize;
         for _ in 0..num_flocks {
             let flock_dist = next_rng(&mut rng) * total_dist;
             let flock_lateral = (next_rng(&mut rng) - 0.5) * 60.0;
@@ -511,7 +597,7 @@ pub fn place_wildlife(
             let flock_alt = 10.0 + next_rng(&mut rng) * 15.0;
             let flock_speed = 4.0 + next_rng(&mut rng) * 2.0;
             let flock_drift = (next_rng(&mut rng) - 0.5) * 2.0;
-            let flock_size = 20 + (next_rng(&mut rng) * 30.0) as usize;
+            let flock_size = 25 + (next_rng(&mut rng) * 35.0) as usize;
 
             for _ in 0..flock_size {
                 let scatter = 3.0;
@@ -532,9 +618,9 @@ pub fn place_wildlife(
         }
     }
 
-    // Geese: 1-3 V-formations of 7-15 birds
+    // Geese: 2-4 V-formations of 7-15 birds
     {
-        let num_formations = 1 + (next_rng(&mut rng) * 3.0) as usize;
+        let num_formations = 2 + (next_rng(&mut rng) * 3.0) as usize;
         for _ in 0..num_formations {
             let leader_dist = next_rng(&mut rng) * total_dist;
             let leader_lateral = (next_rng(&mut rng) - 0.5) * 40.0;
@@ -571,7 +657,7 @@ pub fn place_wildlife(
     }
 
     WildlifePlacement {
-        squirrels, deer, turtles, egrets,
+        squirrels, deer, turkeys, turtles, egrets,
         crows, hawks, starlings, geese,
     }
 }

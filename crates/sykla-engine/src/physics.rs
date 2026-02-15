@@ -1,4 +1,5 @@
 use crate::terrain::{RoutePoint, SurfaceType, surface_at};
+use crate::turnaround::{RouteDirection, RouteTopology};
 
 /// Riding position affects aerodynamic drag (CdA).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,6 +30,7 @@ pub struct PhysicsParams {
     pub drivetrain_efficiency: f32,
     pub max_speed: f32,
     pub min_speed: f32,
+    pub ftp_watts: f32,
 }
 
 impl PhysicsParams {
@@ -47,6 +49,7 @@ impl Default for PhysicsParams {
             drivetrain_efficiency: 0.97,
             max_speed: 27.8, // 100 km/h — pro descents
             min_speed: 1.0,
+            ftp_watts: 250.0,
         }
     }
 }
@@ -61,6 +64,8 @@ pub struct PhysicsState {
     pub heart_rate: u32,
     pub cadence: u32,
     pub elevation: f32,
+    pub crank_angle: f32,
+    pub ftp_watts: f32,
 }
 
 impl Default for PhysicsState {
@@ -75,6 +80,8 @@ impl Default for PhysicsState {
             heart_rate: 145,
             cadence: 85,
             elevation: 0.0,
+            crank_angle: 0.0,
+            ftp_watts: 250.0,
         }
     }
 }
@@ -141,6 +148,8 @@ pub fn update_physics(
     points: &[RoutePoint],
     route_length: f32,
     dt: f32,
+    direction: RouteDirection,
+    topology: RouteTopology,
 ) {
     state.elapsed_secs += dt;
     state.gradient = gradient_at(points, state.distance);
@@ -159,7 +168,13 @@ pub fn update_physics(
     // Altitude-adjusted air density (assume 15°C)
     let rho = air_density(state.elevation, 15.0);
 
-    let f_gravity = mass * G * state.gradient;
+    // Direction-aware gradient for gravity
+    let effective_gradient = match direction {
+        RouteDirection::Forward => state.gradient,
+        RouteDirection::Reverse => -state.gradient,
+    };
+
+    let f_gravity = mass * G * effective_gradient;
     let f_rolling = crr * mass * G;
     let f_aero = 0.5 * cda * rho * v * v;
     let f_drive = (state.power_watts * params.drivetrain_efficiency) / v;
@@ -168,10 +183,31 @@ pub fn update_physics(
     let accel = f_net / mass;
     state.speed = (state.speed + accel * dt).clamp(params.min_speed, params.max_speed);
     let step = state.speed * dt;
-    state.distance += step;
+
+    // Direction-aware distance
+    match direction {
+        RouteDirection::Forward => { state.distance += step; }
+        RouteDirection::Reverse => { state.distance -= step; }
+    }
     state.total_distance += step;
 
-    if state.distance > route_length {
-        state.distance -= route_length;
+    // Accumulate crank angle from cadence for FPV camera sync
+    state.ftp_watts = params.ftp_watts;
+    let cadence_rad_per_sec = (state.cadence as f32 / 60.0) * std::f32::consts::TAU;
+    state.crank_angle = (state.crank_angle + cadence_rad_per_sec * dt) % std::f32::consts::TAU;
+
+    // Topology-aware wrapping
+    match topology {
+        RouteTopology::Loop => {
+            if state.distance > route_length {
+                state.distance -= route_length;
+            }
+            if state.distance < 0.0 {
+                state.distance += route_length;
+            }
+        }
+        RouteTopology::OutAndBack => {
+            state.distance = state.distance.clamp(0.0, route_length);
+        }
     }
 }
