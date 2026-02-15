@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::mesh::{CpuMesh, Vertex};
 use crate::mesh_helpers::{add_cylinder, add_ellipsoid, add_wing};
-use crate::terrain::{RoutePoint, interpolate_point, offset_position};
+use crate::terrain::{RoutePoint, DemTerrainSource, interpolate_point, interpolate_point_geo, offset_position};
 use crate::vegetation::InstanceData;
 use crate::water::WaterFeature;
 
@@ -343,6 +343,7 @@ pub struct WildlifePlacement {
 pub fn place_wildlife(
     points: &[RoutePoint],
     water_features: &[WaterFeature],
+    dem: Option<&DemTerrainSource>,
 ) -> WildlifePlacement {
     let total_dist = points.last().map(|p| p.distance_m as f32).unwrap_or(0.0);
     let mut rng: u64 = 98765;
@@ -387,8 +388,9 @@ pub fn place_wildlife(
                 let lateral = side * (5.0 + next_rng(&mut rng) * 25.0);
                 let z_jitter = (next_rng(&mut rng) - 0.5) * slot_spacing;
                 let dist_along = (base_dist + z_jitter) as f64;
-                let (px, pz, y, fx, fz) = interpolate_point(points, dist_along);
+                let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
                 let (wx, wz) = offset_position(px, pz, fx, fz, lateral);
+                let y = if let Some(d) = dem { d.sample_at(gx, gz, fx, fz, lateral).unwrap_or(y) } else { y };
                 let scale = 0.8 + next_rng(&mut rng) * 0.4;
                 squirrels.push(InstanceData { position: [wx, y, wz], scale });
             }
@@ -416,8 +418,9 @@ pub fn place_wildlife(
             for i in 0..(group_size + extra) {
                 let lateral = base_lateral + (next_rng(&mut rng) - 0.5) * 10.0;
                 let dist_along = (base_dist + (next_rng(&mut rng) - 0.5) * 20.0) as f64;
-                let (px, pz, y, fx, fz) = interpolate_point(points, dist_along);
+                let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
                 let (wx, wz) = offset_position(px, pz, fx, fz, lateral);
+                let y = if let Some(d) = dem { d.sample_at(gx, gz, fx, fz, lateral).unwrap_or(y) } else { y };
                 let scale = 0.85 + next_rng(&mut rng) * 0.30;
                 let scale = if near_water && i >= group_size { scale * 0.9 } else { scale };
                 deer.push(InstanceData { position: [wx, y, wz], scale });

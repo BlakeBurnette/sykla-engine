@@ -6,8 +6,10 @@ use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraUniform};
 use crate::cyclist::CyclistInstanceData;
+use crate::grass_blades::GrassBladeInstance;
 use crate::mesh::{GpuMesh, Vertex};
-use crate::vegetation::InstanceData;
+use crate::skeleton::{MAX_CYCLISTS, NUM_BONES};
+use crate::vegetation::{InstanceData, TreeInstanceData};
 use crate::wildlife::AnimatedInstanceData;
 
 const SHADOW_MAP_SIZE: u32 = 4096;
@@ -28,6 +30,7 @@ pub struct MaterialUniform {
     pub mid_color: [f32; 4],
     pub high_color: [f32; 4],
     pub zone_params: [f32; 4],
+    pub terrain_params: [f32; 4],
 }
 
 pub struct DrawCall {
@@ -49,11 +52,47 @@ pub struct AnimatedDrawCall {
     pub material_bind_group: wgpu::BindGroup,
 }
 
-pub struct CyclistDrawCall {
+pub struct GrassShellDraw {
+    pub mesh: GpuMesh,
+    pub material_bind_group: wgpu::BindGroup,
+    pub num_shells: u32,
+}
+
+pub struct GrassBladeDrawCall {
     pub mesh: GpuMesh,
     pub instance_buffer: wgpu::Buffer,
     pub instance_count: u32,
     pub material_bind_group: wgpu::BindGroup,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum CyclistPipeline {
+    Solid,
+    Textured,
+    Skin,
+}
+
+pub struct CyclistMeshPart {
+    pub mesh: GpuMesh,
+    pub material_bind_group: wgpu::BindGroup,
+    pub pipeline: CyclistPipeline,
+}
+
+pub struct CyclistModel {
+    pub parts: Vec<CyclistMeshPart>,
+    pub instance_buffer: wgpu::Buffer,
+    pub instance_count: u32,
+}
+
+pub struct TreeMeshPart {
+    pub mesh: GpuMesh,
+    pub material_bind_group: wgpu::BindGroup,
+}
+
+pub struct TreeModel {
+    pub parts: Vec<TreeMeshPart>,
+    pub instance_buffer: wgpu::Buffer,
+    pub instance_count: u32,
 }
 
 pub struct Renderer {
@@ -64,27 +103,38 @@ pub struct Renderer {
     // Main pass pipelines
     pipeline: wgpu::RenderPipeline,
     pipeline_road: wgpu::RenderPipeline,
+    pipeline_grass_shell: wgpu::RenderPipeline,
+    pipeline_grass_blade: wgpu::RenderPipeline,
     pipeline_instanced: wgpu::RenderPipeline,
     pipeline_animated: wgpu::RenderPipeline,
     pipeline_cyclist: wgpu::RenderPipeline,
+    pipeline_textured_cyclist: wgpu::RenderPipeline,
+    pipeline_skin_cyclist: wgpu::RenderPipeline,
     pipeline_water: wgpu::RenderPipeline,
     pipeline_emissive_instanced: wgpu::RenderPipeline,
+    pipeline_textured_instanced: wgpu::RenderPipeline,
     // Shadow pass pipelines
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_pipeline_instanced: wgpu::RenderPipeline,
     shadow_pipeline_animated: wgpu::RenderPipeline,
     shadow_pipeline_cyclist: wgpu::RenderPipeline,
+    shadow_pipeline_textured_instanced: wgpu::RenderPipeline,
     // Bind groups and buffers
     camera_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     shadow_bind_group: wgpu::BindGroup,
     shadow_depth_view: wgpu::TextureView,
     material_bgl: wgpu::BindGroupLayout,
+    pub textured_material_bgl: wgpu::BindGroupLayout,
     light_buffer: wgpu::Buffer,
     depth_view: wgpu::TextureView,
     pub light_dir: Vec3,
     pub width: u32,
     pub height: u32,
+    // Bone matrix skinning
+    bone_buffer: wgpu::Buffer,
+    bone_bind_group: wgpu::BindGroup,
+    shadow_bone_bind_group: wgpu::BindGroup,
     // HUD
     pipeline_hud: wgpu::RenderPipeline,
     hud_camera_buffer: wgpu::Buffer,
@@ -104,8 +154,8 @@ fn hud_ortho_uniform(w: f32, h: f32) -> CameraUniform {
     }
 }
 
-const HUD_MAX_VERTS: usize = 4096;
-const HUD_MAX_INDICES: usize = 8192;
+const HUD_MAX_VERTS: usize = 16384;
+const HUD_MAX_INDICES: usize = 32768;
 
 impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>) -> Self {
@@ -135,7 +185,7 @@ impl Renderer {
             .expect("No suitable GPU adapter found");
 
         let required_limits = if cfg!(target_arch = "wasm32") {
-            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+            wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits())
         } else {
             wgpu::Limits::default()
         };
@@ -212,7 +262,30 @@ impl Renderer {
 
         let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material_bgl"),
-            entries: &[bgl_uniform(0, wgpu::ShaderStages::FRAGMENT)],
+            entries: &[bgl_uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
+        });
+
+        let textured_material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("textured_material_bgl"),
+            entries: &[
+                bgl_uniform(0, wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
 
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -295,6 +368,49 @@ impl Renderer {
             ],
         });
 
+        // --- Bone matrix storage buffer (for cyclist skinning) ---
+
+        let bone_buffer_size = (MAX_CYCLISTS * NUM_BONES * std::mem::size_of::<[[f32; 4]; 4]>()) as u64;
+        let bone_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bone_matrix_buffer"),
+            size: bone_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bone_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bone_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bone_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bone_bg"),
+            layout: &bone_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bone_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Shadow cyclist uses the same buffer but at @group(1)
+        let shadow_bone_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_bone_bg"),
+            layout: &bone_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bone_buffer.as_entire_binding(),
+            }],
+        });
+
         // --- Pipeline layouts ---
 
         let main_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -306,6 +422,20 @@ impl Renderer {
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow_layout"),
             bind_group_layouts: &[&camera_bgl],
+            push_constant_ranges: &[],
+        });
+
+        // Cyclist layout: [camera, material, shadow, bones] — 4 groups
+        let cyclist_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cyclist_layout"),
+            bind_group_layouts: &[&camera_bgl, &material_bgl, &shadow_bgl, &bone_bgl],
+            push_constant_ranges: &[],
+        });
+
+        // Shadow cyclist layout: [camera, bones] — 2 groups
+        let shadow_cyclist_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow_cyclist_layout"),
+            bind_group_layouts: &[&camera_bgl, &bone_bgl],
             push_constant_ranges: &[],
         });
 
@@ -402,6 +532,84 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+
+        // Grass shell pipeline — alpha blended, no depth write, renders grass volume
+        let pipeline_grass_shell =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("grass_shell_pipeline"),
+                layout: Some(&main_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_grass_shell"),
+                    buffers: &[Vertex::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_grass_shell"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Grass blade pipeline — instanced individual blades, alpha blended, no depth write
+        let pipeline_grass_blade =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("grass_blade_pipeline"),
+                layout: Some(&main_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_grass_blade"),
+                    buffers: &[Vertex::layout(), GrassBladeInstance::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_grass_blade"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
         // Main instanced pipeline
         let pipeline_instanced = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -540,11 +748,11 @@ impl Renderer {
                 cache: None,
             });
 
-        // Cyclist instance pipeline (pedal animation in vs_cyclist)
+        // Cyclist instance pipeline (bone matrix skinning in vs_cyclist)
         let pipeline_cyclist =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("cyclist_pipeline"),
-                layout: Some(&main_layout),
+                layout: Some(&cyclist_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_cyclist"),
@@ -553,7 +761,7 @@ impl Renderer {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some("fs_cyclist"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -571,7 +779,7 @@ impl Renderer {
         let shadow_pipeline_cyclist =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shadow_cyclist_pipeline"),
-                layout: Some(&shadow_layout),
+                layout: Some(&shadow_cyclist_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_shadow_cyclist"),
@@ -580,7 +788,129 @@ impl Renderer {
                 },
                 fragment: None,
                 primitive,
-                depth_stencil: Some(shadow_depth_stencil),
+                depth_stencil: Some(shadow_depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Textured cyclist pipeline: [camera, textured_material, shadow, bones]
+        let textured_cyclist_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("textured_cyclist_layout"),
+            bind_group_layouts: &[&camera_bgl, &textured_material_bgl, &shadow_bgl, &bone_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline_textured_cyclist =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("textured_cyclist_pipeline"),
+                layout: Some(&textured_cyclist_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_textured_cyclist"),
+                    buffers: &[Vertex::layout(), CyclistInstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_textured_cyclist"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive,
+                depth_stencil: Some(depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Skin cyclist pipeline: same layout as cyclist [camera, material, shadow, bones]
+        // Uses vs_skin_cyclist + fs_skin_cyclist for realistic skin rendering
+        let pipeline_skin_cyclist =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("skin_cyclist_pipeline"),
+                layout: Some(&cyclist_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_skin_cyclist"),
+                    buffers: &[Vertex::layout(), CyclistInstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_skin_cyclist"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive,
+                depth_stencil: Some(depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Textured instanced pipeline (GLB trees with UV-mapped textures)
+        let textured_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("textured_layout"),
+            bind_group_layouts: &[&camera_bgl, &textured_material_bgl, &shadow_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let textured_primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None, // Foliage visible from both sides
+            ..Default::default()
+        };
+
+        let pipeline_textured_instanced =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("textured_instanced_pipeline"),
+                layout: Some(&textured_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_tree_instanced"),
+                    buffers: &[Vertex::layout(), TreeInstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_textured"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: textured_primitive,
+                depth_stencil: Some(depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        let shadow_pipeline_textured_instanced =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_textured_inst_pipeline"),
+                layout: Some(&shadow_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_shadow_tree_inst"),
+                    buffers: &[Vertex::layout(), TreeInstanceData::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive: textured_primitive,
+                depth_stencil: Some(shadow_depth_stencil.clone()),
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
                 cache: None,
@@ -719,6 +1049,7 @@ impl Renderer {
             mid_color: [1.0, 1.0, 1.0, 1.0],
             high_color: [1.0, 1.0, 1.0, 1.0],
             zone_params: [99999.0; 4],
+            terrain_params: [0.0; 4],
         };
         let hud_mat_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("hud_material_buffer"),
@@ -757,25 +1088,35 @@ impl Renderer {
             config,
             pipeline,
             pipeline_road,
+            pipeline_grass_shell,
+            pipeline_grass_blade,
             pipeline_instanced,
             pipeline_animated,
             pipeline_cyclist,
+            pipeline_textured_cyclist,
+            pipeline_skin_cyclist,
             pipeline_water,
             pipeline_emissive_instanced,
+            pipeline_textured_instanced,
             shadow_pipeline,
             shadow_pipeline_instanced,
             shadow_pipeline_animated,
             shadow_pipeline_cyclist,
+            shadow_pipeline_textured_instanced,
             camera_bind_group,
             camera_buffer,
             shadow_bind_group,
             shadow_depth_view,
             material_bgl,
+            textured_material_bgl,
             light_buffer,
             depth_view,
             light_dir,
             width,
             height,
+            bone_buffer,
+            bone_bind_group,
+            shadow_bone_bind_group,
             pipeline_hud,
             hud_camera_buffer,
             hud_camera_bind_group,
@@ -809,6 +1150,7 @@ impl Renderer {
             mid_color: color,
             high_color: color,
             zone_params: [99999.0; 4],
+            terrain_params: [0.0; 4],
         };
         let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material_buffer"),
@@ -825,18 +1167,79 @@ impl Renderer {
         })
     }
 
+    /// Create a cyclist material with optional per-bone coloring for bike parts.
+    /// If `frame_color` and `component_color` are provided, terrain_params.x is set > 0
+    /// to enable per-bone coloring in fs_cyclist (bone 20 = frame, 21/22 = components).
+    pub fn create_cyclist_material(
+        &self,
+        base_color: [f32; 4],
+        frame_color: Option<[f32; 3]>,
+        component_color: Option<[f32; 3]>,
+    ) -> wgpu::BindGroup {
+        let has_bone_colors = frame_color.is_some() || component_color.is_some();
+        let fc = frame_color.unwrap_or([base_color[0], base_color[1], base_color[2]]);
+        let cc = component_color.unwrap_or([base_color[0], base_color[1], base_color[2]]);
+        let uniform = MaterialUniform {
+            base_color,
+            mid_color: [fc[0], fc[1], fc[2], 1.0],
+            high_color: [cc[0], cc[1], cc[2], 1.0],
+            zone_params: [99999.0; 4],
+            terrain_params: [if has_bone_colors { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cyclist_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cyclist_material_bg"),
+            layout: &self.material_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    }
+
+    /// Create a foliage material with snow-on-normals flag (mid_color.w = 2.0).
+    /// The shader detects mid_color.w > 1.5 and applies white snow to upward-facing surfaces.
+    pub fn create_snow_foliage_material(&self, color: [f32; 4]) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color: color,
+            mid_color: [color[0], color[1], color[2], 2.0], // flag for snow-on-normals
+            high_color: color,
+            zone_params: [99999.0; 4],
+            terrain_params: [0.0; 4],
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("snow_foliage_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("snow_foliage_material_bg"),
+            layout: &self.material_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    }
+
     pub fn create_terrain_material(
         &self,
         base: [f32; 4],
         mid: [f32; 4],
         high: [f32; 4],
         zones: [f32; 4],
+        terrain_params: [f32; 4],
     ) -> wgpu::BindGroup {
         let uniform = MaterialUniform {
             base_color: base,
             mid_color: mid,
             high_color: high,
             zone_params: zones,
+            terrain_params,
         };
         let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain_material_buffer"),
@@ -859,6 +1262,7 @@ impl Renderer {
             mid_color: color,
             high_color: color,
             zone_params: [if markings { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            terrain_params: [0.0; 4],
         };
         let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("road_material_buffer"),
@@ -875,9 +1279,86 @@ impl Renderer {
         })
     }
 
+    pub fn create_grass_material(&self, params: &crate::grass::GrassParams) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color: [params.color_base[0], params.color_base[1], params.color_base[2], params.num_shells as f32],
+            mid_color: [params.color_tip[0], params.color_tip[1], params.color_tip[2], params.shell_height],
+            high_color: [params.density, params.wind_strength, params.wind_dir[0], params.wind_dir[1]],
+            zone_params: [params.fade_start, params.fade_end, 0.0, 0.0],
+            terrain_params: [0.0; 4],
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grass_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grass_material_bg"),
+            layout: &self.material_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    }
+
+    pub fn create_grass_blade_material(
+        &self,
+        config: &crate::grass_blades::GrassBladeConfig,
+    ) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color: [config.color_base[0], config.color_base[1], config.color_base[2], 0.0],
+            mid_color: [config.color_tip[0], config.color_tip[1], config.color_tip[2], 0.0],
+            high_color: [config.wind_strength, 0.0, 0.7, 0.7],
+            zone_params: [config.fade_start, config.fade_end, 0.0, 0.0],
+            terrain_params: [0.0; 4],
+        };
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("grass_blade_material_buffer"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grass_blade_material_bg"),
+            layout: &self.material_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    }
+
+    pub fn create_grass_blade_instance_buffer(&self, max_instances: usize) -> wgpu::Buffer {
+        let size = (max_instances * std::mem::size_of::<GrassBladeInstance>()) as u64;
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("grass_blade_instance_buffer"),
+            size: size.max(std::mem::size_of::<GrassBladeInstance>() as u64),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
     pub fn set_fog_color(&self, color: [f32; 4]) {
         let offset = std::mem::offset_of!(LightUniform, fog_color) as u64;
         self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&color));
+    }
+
+    pub fn set_light_direction_uniform(&self, dir: [f32; 3]) {
+        let padded: [f32; 4] = [dir[0], dir[1], dir[2], 0.0];
+        let offset = std::mem::offset_of!(LightUniform, direction) as u64;
+        self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&padded));
+    }
+
+    pub fn set_light_color(&self, color: [f32; 4]) {
+        let offset = std::mem::offset_of!(LightUniform, color) as u64;
+        self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&color));
+    }
+
+    pub fn set_light_ambient(&self, ambient: [f32; 4]) {
+        let offset = std::mem::offset_of!(LightUniform, ambient) as u64;
+        self.queue.write_buffer(&self.light_buffer, offset, bytemuck::bytes_of(&ambient));
     }
 
     pub fn create_instance_buffer(&self, instances: &[InstanceData]) -> wgpu::Buffer {
@@ -932,6 +1413,142 @@ impl Renderer {
             })
     }
 
+    pub fn create_tree_instance_buffer(&self, instances: &[TreeInstanceData]) -> wgpu::Buffer {
+        if instances.is_empty() {
+            return self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tree_instance_buffer_empty"),
+                size: std::mem::size_of::<TreeInstanceData>() as u64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            });
+        }
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tree_instance_buffer"),
+                contents: bytemuck::cast_slice(instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+    }
+
+    pub fn create_textured_material(
+        &self,
+        color: [f32; 4],
+        texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color: color,
+            mid_color: color,
+            high_color: color,
+            zone_params: [99999.0; 4],
+            terrain_params: [0.0; 4],
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("textured_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("textured_material_bg"),
+            layout: &self.textured_material_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
+
+    pub fn create_textured_cyclist_material(
+        &self,
+        base_color: [f32; 4],
+        texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        let uniform = MaterialUniform {
+            base_color,
+            mid_color: base_color,
+            high_color: base_color,
+            zone_params: [99999.0; 4],
+            terrain_params: [0.0; 4],
+        };
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("textured_cyclist_material_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("textured_cyclist_material_bg"),
+            layout: &self.textured_material_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
+
+    pub fn create_gpu_texture(&self, rgba: &[u8], width: u32, height: u32) -> (wgpu::TextureView, wgpu::Sampler) {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("jersey_texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("jersey_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        (view, sampler)
+    }
+
     pub fn update_hud(&mut self, vertices: &[Vertex], indices: &[u32]) {
         let vert_count = vertices.len().min(HUD_MAX_VERTS);
         let idx_count = indices.len().min(HUD_MAX_INDICES);
@@ -958,16 +1575,29 @@ impl Renderer {
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
+    pub fn update_bone_matrices(&self, matrices: &[[[f32; 4]; 4]]) {
+        if !matrices.is_empty() {
+            self.queue.write_buffer(
+                &self.bone_buffer,
+                0,
+                bytemuck::cast_slice(matrices),
+            );
+        }
+    }
+
     pub fn render(
         &self,
         draws: &[DrawCall],
         road_draws: &[DrawCall],
+        grass_shell_draws: &[GrassShellDraw],
+        grass_blade_draws: &[GrassBladeDrawCall],
         instanced_draws: &[InstancedDrawCall],
         animated_draws: &[AnimatedDrawCall],
-        cyclist_draws: &[CyclistDrawCall],
+        cyclist_models: &[CyclistModel],
         water_draws: &[DrawCall],
         sky_color: [f32; 3],
         emissive_instanced_draws: &[InstancedDrawCall],
+        tree_models: &[TreeModel],
     ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -1028,15 +1658,31 @@ impl Renderer {
                 pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
             }
 
-            // Cyclist shadow draws
+            // Cyclist shadow draws (layout: [camera, bones])
             pass.set_pipeline(&self.shadow_pipeline_cyclist);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for call in cyclist_draws {
-                if call.instance_count == 0 { continue; }
-                pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, call.instance_buffer.slice(..));
-                pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
+            pass.set_bind_group(1, &self.shadow_bone_bind_group, &[]);
+            for model in cyclist_models {
+                if model.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
+                for part in &model.parts {
+                    pass.set_vertex_buffer(0, part.mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(part.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..part.mesh.num_indices, 0, 0..model.instance_count);
+                }
+            }
+
+            // Textured tree shadow draws
+            pass.set_pipeline(&self.shadow_pipeline_textured_instanced);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for model in tree_models {
+                if model.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
+                for part in &model.parts {
+                    pass.set_vertex_buffer(0, part.mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(part.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..part.mesh.num_indices, 0, 0..model.instance_count);
+                }
             }
         }
 
@@ -1090,6 +1736,35 @@ impl Renderer {
                 pass.draw_indexed(0..call.mesh.num_indices, 0, 0..1);
             }
 
+            // Grass shell draws — volumetric grass overlaid on terrain
+            pass.set_pipeline(&self.pipeline_grass_shell);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            for draw in grass_shell_draws {
+                pass.set_bind_group(1, &draw.material_bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..draw.mesh.num_indices, 0, 0..draw.num_shells);
+            }
+
+            // Grass blade draws — instanced individual blades
+            pass.set_pipeline(&self.pipeline_grass_blade);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            for draw in grass_blade_draws {
+                if draw.instance_count == 0 {
+                    continue;
+                }
+                pass.set_bind_group(1, &draw.material_bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, draw.instance_buffer.slice(..));
+                pass.set_index_buffer(
+                    draw.mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..draw.mesh.num_indices, 0, 0..draw.instance_count);
+            }
+
             // Instanced main draws
             pass.set_pipeline(&self.pipeline_instanced);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -1116,17 +1791,58 @@ impl Renderer {
                 pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
             }
 
-            // Cyclist main draws
+            // Cyclist solid parts (layout: [camera, material, shadow, bones])
             pass.set_pipeline(&self.pipeline_cyclist);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.shadow_bind_group, &[]);
-            for call in cyclist_draws {
-                if call.instance_count == 0 { continue; }
-                pass.set_bind_group(1, &call.material_bind_group, &[]);
-                pass.set_vertex_buffer(0, call.mesh.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, call.instance_buffer.slice(..));
-                pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
+            pass.set_bind_group(3, &self.bone_bind_group, &[]);
+            for model in cyclist_models {
+                if model.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
+                for part in &model.parts {
+                    if part.pipeline == CyclistPipeline::Solid {
+                        pass.set_bind_group(1, &part.material_bind_group, &[]);
+                        pass.set_vertex_buffer(0, part.mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(part.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..part.mesh.num_indices, 0, 0..model.instance_count);
+                    }
+                }
+            }
+
+            // Cyclist textured parts (layout: [camera, textured_material, shadow, bones])
+            pass.set_pipeline(&self.pipeline_textured_cyclist);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            pass.set_bind_group(3, &self.bone_bind_group, &[]);
+            for model in cyclist_models {
+                if model.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
+                for part in &model.parts {
+                    if part.pipeline == CyclistPipeline::Textured {
+                        pass.set_bind_group(1, &part.material_bind_group, &[]);
+                        pass.set_vertex_buffer(0, part.mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(part.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..part.mesh.num_indices, 0, 0..model.instance_count);
+                    }
+                }
+            }
+
+            // Cyclist skin parts (layout: [camera, material, shadow, bones])
+            pass.set_pipeline(&self.pipeline_skin_cyclist);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            pass.set_bind_group(3, &self.bone_bind_group, &[]);
+            for model in cyclist_models {
+                if model.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
+                for part in &model.parts {
+                    if part.pipeline == CyclistPipeline::Skin {
+                        pass.set_bind_group(1, &part.material_bind_group, &[]);
+                        pass.set_vertex_buffer(0, part.mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(part.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..part.mesh.num_indices, 0, 0..model.instance_count);
+                    }
+                }
             }
 
             // Emissive instanced draws (cabin windows — no lighting)
@@ -1140,6 +1856,21 @@ impl Renderer {
                 pass.set_vertex_buffer(1, call.instance_buffer.slice(..));
                 pass.set_index_buffer(call.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..call.mesh.num_indices, 0, 0..call.instance_count);
+            }
+
+            // Textured tree main draws
+            pass.set_pipeline(&self.pipeline_textured_instanced);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+            for model in tree_models {
+                if model.instance_count == 0 { continue; }
+                pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
+                for part in &model.parts {
+                    pass.set_bind_group(1, &part.material_bind_group, &[]);
+                    pass.set_vertex_buffer(0, part.mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(part.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..part.mesh.num_indices, 0, 0..model.instance_count);
+                }
             }
 
             // Water draws (last, alpha blended)

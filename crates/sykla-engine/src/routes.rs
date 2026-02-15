@@ -1,4 +1,5 @@
-use crate::terrain::{RoutePoint, SurfaceType};
+use crate::dem::GeoOrigin;
+use crate::terrain::{DemTerrainSource, RoutePoint, SurfaceType, TerrainConfig};
 use crate::vegetation::VegetationConfig;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,9 +44,39 @@ pub struct RouteStyle {
     pub cabin_spacing_m: f32,
     /// Whether to generate background mountains
     pub mountains: bool,
+    /// Light direction FROM sun TO scene (normalized)
+    pub light_direction: [f32; 3],
+    /// Key light RGBA
+    pub light_color: [f32; 4],
+    /// Fill/ambient RGBA
+    pub light_ambient: [f32; 4],
+    /// Terrain falloff — how steeply terrain drops from road center (0.08 flat, 0.35 mountain)
+    pub terrain_falloff: f32,
+    /// Terrain noise amplitude — 1.0 for flat trails, 30-50 for mountain terrain
+    pub terrain_noise_amplitude: f32,
+    /// Optional DEM data for real elevation terrain (embedded via include_bytes)
+    pub dem_data: Option<&'static [u8]>,
+    /// Override terrain half-width (None = default: 1500 DEM, 300 procedural)
+    pub dem_half_width: Option<f32>,
+    /// Override terrain cross-section count (None = default: 100 DEM, 48 procedural)
+    pub dem_cross_sections: Option<usize>,
+    /// Terrain splatting params [path_blend_width, slope_threshold, noise_scale, enable]
+    pub terrain_params: [f32; 4],
 }
 
 impl RouteStyle {
+    pub fn terrain_config(&self, dem: Option<DemTerrainSource>) -> TerrainConfig {
+        let is_dem = dem.is_some();
+        TerrainConfig {
+            half_width: self.dem_half_width.unwrap_or(if is_dem { 1500.0 } else { 300.0 }),
+            cross_sections: self.dem_cross_sections.unwrap_or(if is_dem { 100 } else { 48 }),
+            falloff: self.terrain_falloff,
+            noise_amplitude: self.terrain_noise_amplitude,
+            elevation_scale: 1.0,
+            dem,
+        }
+    }
+
     /// Lush temperate forest (default, Blue Ridge, ATT)
     fn forest() -> Self {
         Self {
@@ -60,12 +91,26 @@ impl RouteStyle {
             canopy_color: [0.10, 0.28, 0.05, 1.0],
             pine_color: [0.06, 0.22, 0.04, 1.0],
             bush_color: [0.14, 0.35, 0.08, 1.0],
-            vegetation: VegetationConfig::default(),
+            vegetation: VegetationConfig {
+                use_eastern_species: true,
+                fallen_tree_probability: 0.005,
+                ..Default::default()
+            },
             fog_color: [0.72, 0.68, 0.52, 80.0],
             sky_color: [0.52, 0.70, 0.82],
             road_markings: RoadMarkings::None,
             cabin_spacing_m: 0.0,
             mountains: false,
+            light_direction: [-0.4, -0.45, -0.35],
+            light_color: [1.0, 0.88, 0.65, 1.0],
+            light_ambient: [0.35, 0.32, 0.22, 1.0],
+            terrain_falloff: 0.08,
+            terrain_noise_amplitude: 1.0,
+            dem_data: None,
+            dem_half_width: None,
+            dem_cross_sections: None,
+            // biome 5 = generic lush forest
+            terrain_params: [0.10, 0.25, 1.0, 5.0],
         }
     }
 
@@ -73,7 +118,7 @@ impl RouteStyle {
     fn alpine() -> Self {
         Self {
             terrain_color: [0.35, 0.55, 0.20, 1.0],       // Lush green meadow
-            terrain_mid_color: [0.45, 0.42, 0.38, 1.0],    // Rocky grey-brown
+            terrain_mid_color: [0.36, 0.48, 0.54, 1.0],    // Slate blue-grey rock
             terrain_high_color: [0.88, 0.90, 0.95, 1.0],   // Blue-white snow
             elevation_zones: [1700.0, 1900.0, 2000.0, 2200.0],
             ground_color: [0.35, 0.32, 0.28, 1.0],
@@ -91,28 +136,39 @@ impl RouteStyle {
                 min_scale: 0.3,
                 max_scale: 0.7,
                 treeline: 1900.0,
+                ..Default::default()
             },
             fog_color: [0.78, 0.82, 0.90, 700.0],
             sky_color: [0.55, 0.72, 0.88],
             road_markings: RoadMarkings::European,
             cabin_spacing_m: 500.0,
             mountains: true,
+            light_direction: [-0.4, -0.45, -0.35],
+            light_color: [1.0, 0.88, 0.65, 1.0],
+            light_ambient: [0.35, 0.32, 0.22, 1.0],
+            terrain_falloff: 0.35,
+            terrain_noise_amplitude: 40.0,
+            dem_data: None,
+            dem_half_width: None,
+            dem_cross_sections: None,
+            // biome 2 = alpine (meadow→rock→snow)
+            terrain_params: [0.05, 0.20, 1.5, 2.0],
         }
     }
 
     /// High alpine winter — snow from start, Col de la Loze
     fn high_alpine_winter() -> Self {
         Self {
-            terrain_color: [0.42, 0.48, 0.35, 1.0],       // Muted winter grass
-            terrain_mid_color: [0.72, 0.74, 0.78, 1.0],    // Patchy snow/rock
-            terrain_high_color: [0.92, 0.94, 0.97, 1.0],   // Deep snow
-            elevation_zones: [1350.0, 1550.0, 1700.0, 1900.0],
-            ground_color: [0.35, 0.32, 0.28, 1.0],
-            road_color: [0.22, 0.22, 0.24, 1.0],           // Wet dark asphalt
+            terrain_color: [0.55, 0.58, 0.52, 1.0],       // Winter grey-green (barely visible, transitions fast)
+            terrain_mid_color: [0.36, 0.48, 0.54, 1.0],    // Slate blue-grey rock (#5B7B8A)
+            terrain_high_color: [0.94, 0.94, 0.91, 1.0],   // Deep snow (#F0F0E8)
+            elevation_zones: [1100.0, 1300.0, 1500.0, 1700.0],
+            ground_color: [0.36, 0.48, 0.54, 1.0],         // Rock color
+            road_color: [0.23, 0.23, 0.26, 1.0],           // Dark grey asphalt (#3A3A42)
             gravel_color: [0.22, 0.22, 0.24, 1.0],
             trunk_color: [0.25, 0.18, 0.10, 1.0],
             canopy_color: [0.15, 0.25, 0.10, 1.0],
-            pine_color: [0.10, 0.20, 0.08, 1.0],
+            pine_color: [0.18, 0.35, 0.15, 1.0],           // Brighter pine (#2D5A27)
             bush_color: [0.20, 0.28, 0.12, 1.0],
             vegetation: VegetationConfig {
                 spacing_m: 6.0,
@@ -122,12 +178,23 @@ impl RouteStyle {
                 min_scale: 0.3,
                 max_scale: 0.7,
                 treeline: 1800.0,
+                ..Default::default()
             },
-            fog_color: [0.82, 0.85, 0.92, 1400.0],
-            sky_color: [0.62, 0.72, 0.85],
+            fog_color: [0.85, 0.88, 0.95, 1600.0],        // White-blue horizon
+            sky_color: [0.55, 0.72, 0.88],                 // Warm cerulean
             road_markings: RoadMarkings::European,
             cabin_spacing_m: 500.0,
             mountains: true,
+            light_direction: [-0.71, -0.57, -0.41],        // 35deg elev, 60deg azimuth
+            light_color: [1.0, 0.96, 0.88, 1.0],           // Warm golden key #FFF4E0
+            light_ambient: [0.38, 0.48, 0.53, 1.0],        // Cool blue fill
+            terrain_falloff: 0.35,
+            terrain_noise_amplitude: 40.0,
+            dem_data: None,
+            dem_half_width: None,
+            dem_cross_sections: None,
+            // biome 2 = alpine (meadow→rock→snow)
+            terrain_params: [0.05, 0.20, 1.5, 2.0],
         }
     }
 
@@ -159,6 +226,16 @@ impl RouteStyle {
             road_markings: RoadMarkings::None,
             cabin_spacing_m: 0.0,
             mountains: false,
+            light_direction: [-0.4, -0.45, -0.35],
+            light_color: [1.0, 0.88, 0.65, 1.0],
+            light_ambient: [0.35, 0.32, 0.22, 1.0],
+            terrain_falloff: 0.15,
+            terrain_noise_amplitude: 10.0,
+            dem_data: None,
+            dem_half_width: None,
+            dem_cross_sections: None,
+            // biome 3 = desert/barren
+            terrain_params: [0.03, 0.15, 2.0, 3.0],
         }
     }
 
@@ -183,6 +260,8 @@ impl RouteStyle {
                 trees_per_slot: 3,
                 min_scale: 0.5,
                 max_scale: 0.9,
+                use_eastern_species: true,
+                fallen_tree_probability: 0.005,
                 ..Default::default()
             },
             fog_color: [0.72, 0.68, 0.52, 10.0],
@@ -190,6 +269,16 @@ impl RouteStyle {
             road_markings: RoadMarkings::None,
             cabin_spacing_m: 0.0,
             mountains: false,
+            light_direction: [-0.4, -0.45, -0.35],
+            light_color: [1.0, 0.88, 0.65, 1.0],
+            light_ambient: [0.35, 0.32, 0.22, 1.0],
+            terrain_falloff: 0.08,
+            terrain_noise_amplitude: 1.0,
+            dem_data: None,
+            dem_half_width: None,
+            dem_cross_sections: None,
+            // biome 4 = coastal
+            terrain_params: [0.12, 0.35, 0.8, 4.0],
         }
     }
 
@@ -214,6 +303,8 @@ impl RouteStyle {
                 trees_per_slot: 4,
                 min_scale: 0.8,
                 max_scale: 1.2,
+                use_eastern_species: true,
+                fallen_tree_probability: 0.005,
                 ..Default::default()
             },
             fog_color: [0.72, 0.68, 0.52, 80.0],
@@ -221,6 +312,16 @@ impl RouteStyle {
             road_markings: RoadMarkings::None,
             cabin_spacing_m: 0.0,
             mountains: false,
+            light_direction: [-0.4, -0.45, -0.35],
+            light_color: [1.0, 0.88, 0.65, 1.0],
+            light_ambient: [0.35, 0.32, 0.22, 1.0],
+            terrain_falloff: 0.08,
+            terrain_noise_amplitude: 1.0,
+            dem_data: None,
+            dem_half_width: Some(800.0),
+            dem_cross_sections: Some(80),
+            // biome 1 = NC Piedmont forest floor
+            terrain_params: [0.15, 0.3, 1.0, 1.0],
         }
     }
 }
@@ -289,24 +390,49 @@ pub fn catalog() -> Vec<RouteInfo> {
 /// Returns the visual style for a given route key.
 pub fn route_style(key: &str) -> RouteStyle {
     match key {
-        "att" => RouteStyle::greenway(),
-        "black-creek" => RouteStyle::greenway(),
-        "oak-creek" => RouteStyle::greenway(),
+        "att" => {
+            #[cfg(feature = "dem")]
+            { let mut s = RouteStyle::greenway(); s.dem_data = Some(include_bytes!("../../../assets/routes/att.dem")); s }
+            #[cfg(not(feature = "dem"))]
+            RouteStyle::greenway()
+        }
+        "black-creek" => {
+            #[cfg(feature = "dem")]
+            { let mut s = RouteStyle::greenway(); s.dem_data = Some(include_bytes!("../../../assets/routes/black-creek.dem")); s }
+            #[cfg(not(feature = "dem"))]
+            RouteStyle::greenway()
+        }
+        "oak-creek" => {
+            #[cfg(feature = "dem")]
+            { let mut s = RouteStyle::greenway(); s.dem_data = Some(include_bytes!("../../../assets/routes/oak-creek.dem")); s }
+            #[cfg(not(feature = "dem"))]
+            RouteStyle::greenway()
+        }
         "demo" => RouteStyle::forest(),
         "alpe-dhuez" => RouteStyle::alpine(),
         "mont-ventoux" => RouteStyle::barren(),
         "stelvio" => RouteStyle::alpine(),
         "blue-ridge" => RouteStyle::forest(),
         "pacific-coast" => RouteStyle::coastal(),
-        "col-de-la-loze" => RouteStyle::high_alpine_winter(),
+        "col-de-la-loze" => {
+            #[cfg(feature = "dem")]
+            {
+                let mut style = RouteStyle::high_alpine_winter();
+                style.dem_data = Some(include_bytes!("../../../assets/routes/col-de-la-loze.dem"));
+                style
+            }
+            #[cfg(not(feature = "dem"))]
+            RouteStyle::high_alpine_winter()
+        }
         _ => RouteStyle::forest(),
     }
 }
 
 /// Generates route points at 10m intervals with curved path positions.
 /// Greenway trails use real GPS data from GPX files for authentic path geometry.
-pub fn generate_route(key: &str) -> Vec<RoutePoint> {
-    let mut points = match key {
+/// Returns the route points and optionally a GeoOrigin for GPX-based routes.
+pub fn generate_route(key: &str) -> (Vec<RoutePoint>, Option<GeoOrigin>) {
+    let (mut points, geo_origin) = match key {
         "att" => {
             let gpx = include_str!("../../../assets/routes/american-tobacco-trail.gpx");
             crate::gpx::generate_from_gpx(gpx, &ATT_ELEVATION)
@@ -323,16 +449,16 @@ pub fn generate_route(key: &str) -> Vec<RoutePoint> {
             let gpx = include_str!("../../../assets/routes/blue-ridge-parkway.gpx");
             crate::gpx::generate_from_gpx(gpx, &BLUE_RIDGE)
         }
-        "demo" => generate_demo(),
-        "alpe-dhuez" => generate_path(&ALPE_DHUEZ, &ALPE_DHUEZ_HEADINGS),
-        "mont-ventoux" => generate_path(&MONT_VENTOUX, &MONT_VENTOUX_HEADINGS),
-        "stelvio" => generate_path(&STELVIO, &STELVIO_HEADINGS),
-        "pacific-coast" => generate_path(&PACIFIC_COAST, &PACIFIC_COAST_HEADINGS),
+        "demo" => (generate_demo(), None),
+        "alpe-dhuez" => (generate_path(&ALPE_DHUEZ, &ALPE_DHUEZ_HEADINGS), None),
+        "mont-ventoux" => (generate_path(&MONT_VENTOUX, &MONT_VENTOUX_HEADINGS), None),
+        "stelvio" => (generate_path(&STELVIO, &STELVIO_HEADINGS), None),
+        "pacific-coast" => (generate_path(&PACIFIC_COAST, &PACIFIC_COAST_HEADINGS), None),
         "col-de-la-loze" => {
             let gpx = include_str!("../../../assets/routes/col-de-la-loze.gpx");
             crate::gpx::generate_from_gpx(gpx, &COL_DE_LA_LOZE)
         }
-        _ => generate_demo(),
+        _ => (generate_demo(), None),
     };
 
     // Tag surface types for specific routes
@@ -347,7 +473,7 @@ pub fn generate_route(key: &str) -> Vec<RoutePoint> {
         }
     }
 
-    points
+    (points, geo_origin)
 }
 
 // ============================================================================
@@ -415,6 +541,9 @@ fn generate_path(
             forward_x,
             forward_z,
             surface: SurfaceType::Paved,
+            banking: 0.0,
+            geo_x: pos_x as f32,
+            geo_z: pos_z as f32,
         });
     }
 

@@ -2,25 +2,30 @@ use std::sync::Arc;
 
 use sykla_engine::camera::{Camera, CameraMode};
 use sykla_engine::cyclist::{
-    CyclistInstanceData, NpcCyclist, generate_cyclist, spawn_npc_cyclists, update_cyclists,
+    CyclistInstanceData, NpcCyclist, load_cyclist_glb, spawn_npc_cyclists, update_cyclists,
 };
+use sykla_engine::dem::{DemTile, GeoOrigin};
+use sykla_engine::skeleton::SkeletonSystem;
 use sykla_engine::glam::Vec3;
 use sykla_engine::hud::{build_hud, build_selector_hud, camera_button_rects};
 use sykla_engine::mesh::{CpuMesh, GpuMesh, Vertex};
 use sykla_engine::physics::{PhysicsParams, PhysicsState, update_physics};
-use sykla_engine::mountains::generate_mountain_ring;
-use sykla_engine::renderer::{AnimatedDrawCall, CyclistDrawCall, DrawCall, InstancedDrawCall, Renderer};
+use sykla_engine::mountains::{generate_mountain_ring, generate_mountain_ring_with_radius};
+use sykla_engine::grass;
+use sykla_engine::grass_blades;
+use sykla_engine::jersey;
+use sykla_engine::renderer::{AnimatedDrawCall, CyclistMeshPart, CyclistModel, CyclistPipeline, DrawCall, GrassBladeDrawCall, GrassShellDraw, InstancedDrawCall, Renderer, TreeModel};
 use sykla_engine::road::{generate_roads_by_surface, RoadConfig};
 use sykla_engine::routes::{self, RoadMarkings};
 use sykla_engine::structures;
 use sykla_engine::terrain::{
-    generate_ground_plane, generate_terrain, interpolate_point, RoutePoint, SurfaceType,
-    TerrainConfig,
+    generate_ground_plane, generate_terrain, interpolate_point, DemTerrainSource, RoutePoint, SurfaceType,
 };
 use sykla_engine::vegetation::{
     generate_bush, generate_canopy, generate_pine_canopy, generate_pine_trunk, generate_trunk,
     place_vegetation, InstanceData,
 };
+use sykla_engine::treeline::{generate_billboard_quad, generate_treeline_strips, TreelineConfig};
 use sykla_engine::water::{detect_water_features, generate_water_mesh};
 use sykla_engine::wildlife::{
     generate_bird, generate_deer, generate_egret, generate_goose, generate_small_bird,
@@ -60,6 +65,7 @@ pub struct AppInner {
     prev_t: f32,
     route_length: f32,
     route_points: Vec<RoutePoint>,
+    geo_origin: Option<GeoOrigin>,
     physics_state: PhysicsState,
     physics_params: PhysicsParams,
     current_route: usize,
@@ -78,10 +84,19 @@ pub struct AppInner {
     camera_mode: CameraMode,
     cursor_pos: (f32, f32),
     // Cyclist rendering
-    cyclist_draws: Vec<CyclistDrawCall>,
+    cyclist_models: Vec<CyclistModel>,
     cyclist_cpu: Vec<CyclistInstanceData>,
     npc_cyclists: Vec<NpcCyclist>,
+    skeleton_system: SkeletonSystem,
     emissive_instanced_draws: Vec<InstancedDrawCall>,
+    tree_models: Vec<TreeModel>,
+    grass_shell_draws: Vec<GrassShellDraw>,
+    grass_blade_draws: Vec<GrassBladeDrawCall>,
+    grass_blade_config: Option<grass_blades::GrassBladeConfig>,
+    grass_blade_last_dist: f32,
+    dem_for_grass: Option<DemTerrainSource>,
+    terrain_half_width: f32,
+    terrain_falloff: f32,
 }
 
 impl AppInner {
@@ -101,6 +116,7 @@ impl AppInner {
             prev_t: 0.0,
             route_length: 0.0,
             route_points: Vec::new(),
+            geo_origin: None,
             physics_state: PhysicsState::default(),
             physics_params: PhysicsParams::default(),
             current_route: 0,
@@ -114,10 +130,19 @@ impl AppInner {
             sky_color: [0.52, 0.70, 0.82],
             camera_mode: CameraMode::ThirdPersonClose,
             cursor_pos: (0.0, 0.0),
-            cyclist_draws: Vec::new(),
+            cyclist_models: Vec::new(),
             cyclist_cpu: Vec::new(),
             npc_cyclists: Vec::new(),
+            skeleton_system: SkeletonSystem::new(32),
             emissive_instanced_draws: Vec::new(),
+            tree_models: Vec::new(),
+            grass_shell_draws: Vec::new(),
+            grass_blade_draws: Vec::new(),
+            grass_blade_config: None,
+            grass_blade_last_dist: -999.0,
+            dem_for_grass: None,
+            terrain_half_width: 300.0,
+            terrain_falloff: 0.08,
         };
 
         // Start city data loading
@@ -254,7 +279,9 @@ impl AppInner {
     fn load_route(&mut self, index: usize) {
         let cat = routes::catalog();
         let key = cat[index].key;
-        self.route_points = routes::generate_route(key);
+        let (points, geo_origin) = routes::generate_route(key);
+        self.route_points = points;
+        self.geo_origin = geo_origin;
         self.route_length = self
             .route_points
             .last()
@@ -268,9 +295,42 @@ impl AppInner {
     fn build_world(&mut self) {
         let style = routes::route_style(self.current_key);
 
+        // Update shadow VP light direction
+        self.renderer.light_dir = Vec3::new(
+            style.light_direction[0],
+            style.light_direction[1],
+            style.light_direction[2],
+        ).normalize();
+
         // Terrain, ground plane, and road
-        let terrain_mesh = generate_terrain(&self.route_points, &TerrainConfig::default());
-        let ground_mesh = generate_ground_plane(&self.route_points, 1000.0);
+        let dem_source = match (style.dem_data, &self.geo_origin) {
+            (Some(bytes), Some(origin)) => {
+                DemTile::from_bytes(bytes).map(|tile| DemTerrainSource { tile, origin: origin.clone() })
+            }
+            _ => None,
+        };
+
+        // Resample route elevations from DEM — always use DEM when available.
+        // The hardcoded elevation profiles are approximations; DEM (SRTM) is authoritative.
+        // Use geo_x/geo_z (original GPS coordinates) for DEM lookup, not pos_x/pos_z
+        // (which may be translated by stitch_segments).
+        if let Some(dem) = &dem_source {
+            for point in &mut self.route_points {
+                let sample_x = if point.geo_x != 0.0 || point.geo_z != 0.0 { point.geo_x } else { point.pos_x };
+                let sample_z = if point.geo_x != 0.0 || point.geo_z != 0.0 { point.geo_z } else { point.pos_z };
+                if let Some(dem_elev) = dem.tile.sample_world(&dem.origin, sample_x, sample_z) {
+                    point.elevation_m = dem_elev as f64;
+                }
+            }
+        }
+
+        let is_dem = dem_source.is_some();
+        let terrain_config = style.terrain_config(dem_source);
+        self.terrain_half_width = terrain_config.half_width;
+        self.terrain_falloff = terrain_config.falloff;
+        let terrain_mesh = generate_terrain(&self.route_points, &terrain_config);
+        let ground_half = if is_dem { 3000.0 } else { 1000.0 };
+        let ground_mesh = generate_ground_plane(&self.route_points, ground_half);
         let road_segments =
             generate_roads_by_surface(&self.route_points, &RoadConfig::default());
 
@@ -282,10 +342,14 @@ impl AppInner {
             style.terrain_mid_color,
             style.terrain_high_color,
             style.elevation_zones,
+            style.terrain_params,
         );
         let ground_mat = self.renderer.create_material(style.ground_color);
 
-        // Set fog and sky from route style
+        // Set lighting, fog, and sky from route style
+        self.renderer.set_light_direction_uniform(style.light_direction);
+        self.renderer.set_light_color(style.light_color);
+        self.renderer.set_light_ambient(style.light_ambient);
         self.renderer.set_fog_color(style.fog_color);
         self.sky_color = style.sky_color;
 
@@ -302,7 +366,11 @@ impl AppInner {
 
         // Mountains — background ring of peaks using terrain material
         if style.mountains {
-            let mountain_mesh = generate_mountain_ring(&self.route_points);
+            let mountain_mesh = if is_dem {
+                generate_mountain_ring_with_radius(&self.route_points, 4000.0)
+            } else {
+                generate_mountain_ring(&self.route_points)
+            };
             if !mountain_mesh.vertices.is_empty() {
                 let mountain_gpu = GpuMesh::from_cpu(&self.renderer.device, &mountain_mesh);
                 let mountain_mat = self.renderer.create_terrain_material(
@@ -310,6 +378,7 @@ impl AppInner {
                     style.terrain_mid_color,
                     style.terrain_high_color,
                     style.elevation_zones,
+                    [0.0; 4], // mountains don't use terrain splatting
                 );
                 self.draws.push(DrawCall {
                     mesh: mountain_gpu,
@@ -334,8 +403,67 @@ impl AppInner {
             });
         }
 
+        // Grass shells (volumetric grass on terrain)
+        let mut grass_shell_draws = Vec::new();
+        if let Some(grass_params) = grass::GrassParams::for_biome(style.terrain_params[3]) {
+            let grass_mesh = GpuMesh::from_cpu(&self.renderer.device, &terrain_mesh);
+            let grass_mat = self.renderer.create_grass_material(&grass_params);
+            grass_shell_draws.push(GrassShellDraw {
+                mesh: grass_mesh,
+                material_bind_group: grass_mat,
+                num_shells: grass_params.num_shells,
+            });
+        }
+        self.grass_shell_draws = grass_shell_draws;
+
+        // Grass blades (instanced individual blades near camera)
+        self.grass_blade_draws.clear();
+        self.grass_blade_config = grass_blades::GrassBladeConfig::for_biome(style.terrain_params[3]);
+        self.grass_blade_last_dist = -999.0;
+
+        // Store DEM for per-frame blade placement
+        self.dem_for_grass = match (style.dem_data, &self.geo_origin) {
+            (Some(bytes), Some(origin)) => {
+                DemTile::from_bytes(bytes).map(|tile| DemTerrainSource { tile, origin: origin.clone() })
+            }
+            _ => None,
+        };
+
+        if let Some(ref blade_config) = self.grass_blade_config {
+            let blade_mesh = grass_blades::create_blade_mesh();
+            let blade_gpu = GpuMesh::from_cpu(&self.renderer.device, &blade_mesh);
+            let blade_mat = self.renderer.create_grass_blade_material(blade_config);
+            let blade_buf = self.renderer.create_grass_blade_instance_buffer(grass_blades::MAX_GRASS_BLADES);
+
+            let initial_blades = grass_blades::generate_blade_instances(
+                &self.route_points,
+                blade_config,
+                0.0,
+                self.dem_for_grass.as_ref(),
+                self.terrain_half_width,
+                self.terrain_falloff,
+            );
+            let blade_count = initial_blades.len() as u32;
+            if !initial_blades.is_empty() {
+                self.renderer.queue.write_buffer(
+                    &blade_buf,
+                    0,
+                    bytemuck::cast_slice(&initial_blades),
+                );
+            }
+            self.grass_blade_draws.push(GrassBladeDrawCall {
+                mesh: blade_gpu,
+                instance_buffer: blade_buf,
+                instance_count: blade_count,
+                material_bind_group: blade_mat,
+            });
+        }
+
         // Vegetation (instanced)
-        let placement = place_vegetation(&self.route_points, &style.vegetation);
+        let placement = place_vegetation(
+            &self.route_points, &style.vegetation, terrain_config.dem.as_ref(),
+            terrain_config.half_width, terrain_config.falloff,
+        );
 
         let trunk_mesh = generate_trunk();
         let canopy_mesh = generate_canopy();
@@ -381,7 +509,13 @@ impl AppInner {
         let trunk_mat = self.renderer.create_material(style.trunk_color);
         let dec_canopy_mat = self.renderer.create_material(style.canopy_color);
         let pine_trunk_mat = self.renderer.create_material(style.trunk_color);
-        let pine_canopy_mat = self.renderer.create_material(style.pine_color);
+        // Winter routes: snow on pine canopies (detected by elevation_zones[0] < 90000)
+        let is_winter = style.elevation_zones[0] < 90000.0;
+        let pine_canopy_mat = if is_winter {
+            self.renderer.create_snow_foliage_material(style.pine_color)
+        } else {
+            self.renderer.create_material(style.pine_color)
+        };
         let bush_mat = self.renderer.create_material(style.bush_color);
         let young_trunk_mat = self.renderer.create_material([
             style.trunk_color[0] + 0.04,
@@ -395,12 +529,17 @@ impl AppInner {
             style.canopy_color[2] + 0.03,
             1.0,
         ]);
-        let young_pine_canopy_mat = self.renderer.create_material([
+        let young_pine_color = [
             style.pine_color[0] + 0.04,
             style.pine_color[1] + 0.08,
             style.pine_color[2] + 0.02,
             1.0,
-        ]);
+        ];
+        let young_pine_canopy_mat = if is_winter {
+            self.renderer.create_snow_foliage_material(young_pine_color)
+        } else {
+            self.renderer.create_material(young_pine_color)
+        };
 
         self.instanced_draws = vec![
             InstancedDrawCall {
@@ -459,6 +598,80 @@ impl AppInner {
             },
         ];
 
+        // Textured GLB trees (eastern species)
+        self.tree_models.clear();
+        if style.vegetation.use_eastern_species {
+            let oak_parts = sykla_engine::trees::load_tree_species(&self.renderer, include_bytes!("../../../assets/trees/oak.glb"));
+            let pine_parts = sykla_engine::trees::load_tree_species(&self.renderer, include_bytes!("../../../assets/trees/loblolly_pine.glb"));
+            let redbud_parts = sykla_engine::trees::load_tree_species(&self.renderer, include_bytes!("../../../assets/trees/redbud.glb"));
+
+            for (parts, instances) in [
+                (oak_parts, &placement.oaks),
+                (pine_parts, &placement.loblolly_pines),
+                (redbud_parts, &placement.redbuds),
+            ] {
+                if !instances.is_empty() {
+                    let buf = self.renderer.create_tree_instance_buffer(instances);
+                    self.tree_models.push(TreeModel {
+                        parts,
+                        instance_buffer: buf,
+                        instance_count: instances.len() as u32,
+                    });
+                }
+            }
+            if !placement.fallen_trees.is_empty() {
+                let fallen_parts = sykla_engine::trees::load_tree_species(&self.renderer, include_bytes!("../../../assets/trees/oak.glb"));
+                let buf = self.renderer.create_tree_instance_buffer(&placement.fallen_trees);
+                self.tree_models.push(TreeModel {
+                    parts: fallen_parts,
+                    instance_buffer: buf,
+                    instance_count: placement.fallen_trees.len() as u32,
+                });
+            }
+        }
+
+        // Treeline strips (distant billboard trees)
+        // Skip when eastern species GLB trees are active
+        if !style.vegetation.use_eastern_species {
+            let treeline_config = TreelineConfig::default();
+            let (close_strip, far_strip) = generate_treeline_strips(
+                &self.route_points,
+                &treeline_config,
+                None,
+            );
+
+            if !close_strip.is_empty() {
+                let billboard_mesh = generate_billboard_quad();
+                let billboard_gpu = GpuMesh::from_cpu(&self.renderer.device, &billboard_mesh);
+                let close_mat = self.renderer.create_material(style.canopy_color);
+                let close_buf = self.renderer.create_instance_buffer(&close_strip);
+                self.instanced_draws.push(InstancedDrawCall {
+                    mesh: billboard_gpu,
+                    instance_buffer: close_buf,
+                    instance_count: close_strip.len() as u32,
+                    material_bind_group: close_mat,
+                });
+            }
+            if !far_strip.is_empty() {
+                let billboard_mesh = generate_billboard_quad();
+                let billboard_gpu = GpuMesh::from_cpu(&self.renderer.device, &billboard_mesh);
+                let far_color = [
+                    style.canopy_color[0] * 0.7 + style.fog_color[0] * 0.3,
+                    style.canopy_color[1] * 0.7 + style.fog_color[1] * 0.3,
+                    style.canopy_color[2] * 0.7 + style.fog_color[2] * 0.3,
+                    1.0,
+                ];
+                let far_mat = self.renderer.create_material(far_color);
+                let far_buf = self.renderer.create_instance_buffer(&far_strip);
+                self.instanced_draws.push(InstancedDrawCall {
+                    mesh: billboard_gpu,
+                    instance_buffer: far_buf,
+                    instance_count: far_strip.len() as u32,
+                    material_bind_group: far_mat,
+                });
+            }
+        }
+
         // Water features
         let water_features = detect_water_features(&self.route_points);
         let water_mat = self.renderer.create_material([0.05, 0.12, 0.18, 0.85]);
@@ -476,7 +689,7 @@ impl AppInner {
             .collect();
 
         // Wildlife
-        let wildlife = place_wildlife(&self.route_points, &water_features);
+        let wildlife = place_wildlife(&self.route_points, &water_features, terrain_config.dem.as_ref());
 
         // Ground animals
         let squirrel_mesh = GpuMesh::from_cpu(&self.renderer.device, &generate_squirrel());
@@ -582,8 +795,8 @@ impl AppInner {
             if !cabin_instances.is_empty() {
                 let body_gpu = GpuMesh::from_cpu(&self.renderer.device, &cabin_body_mesh);
                 let window_gpu = GpuMesh::from_cpu(&self.renderer.device, &cabin_window_mesh);
-                let body_mat = self.renderer.create_material([0.40, 0.28, 0.15, 1.0]);
-                let window_mat = self.renderer.create_material([2.5, 1.8, 0.8, 1.0]);
+                let body_mat = self.renderer.create_material([0.42, 0.26, 0.15, 1.0]); // #6B4226 timber
+                let window_mat = self.renderer.create_material([2.0, 1.44, 0.60, 1.0]); // #FFB84D amber glow
                 let body_buf = self.renderer.create_instance_buffer(&cabin_instances);
                 let window_buf = self.renderer.create_instance_buffer(&cabin_instances);
                 let count = cabin_instances.len() as u32;
@@ -627,11 +840,9 @@ impl AppInner {
             }
         }
 
-        // Cyclists
+        // Cyclists (multi-part colored model)
         self.npc_cyclists = spawn_npc_cyclists(self.route_length, 20);
-        let cyclist_mesh_cpu = generate_cyclist();
-        let cyclist_gpu = GpuMesh::from_cpu(&self.renderer.device, &cyclist_mesh_cpu);
-        let cyclist_mat = self.renderer.create_material([0.15, 0.30, 0.65, 1.0]);
+        let cyclist_parts = load_cyclist_glb(include_bytes!("../../../assets/cyclist.glb"));
 
         self.cyclist_cpu = update_cyclists(
             &mut self.npc_cyclists,
@@ -650,11 +861,71 @@ impl AppInner {
         let cyclist_buf = self.renderer.create_cyclist_instance_buffer(&self.cyclist_cpu);
         let cyclist_count = self.cyclist_cpu.len() as u32;
 
-        self.cyclist_draws = vec![CyclistDrawCall {
-            mesh: cyclist_gpu,
+        // Tour de France maillot jaune cyclist colors
+        let frame_yellow = [0.95, 0.72, 0.0];
+        let ultegra_silver = [0.55, 0.55, 0.58];
+        let ultegra_dark = [0.22, 0.22, 0.24];
+
+        // Generate jersey texture (maillot jaune with bib number "1")
+        let (jersey_rgba, jw, jh) = jersey::generate_jersey_texture(
+            [255, 191, 0], // maillot jaune yellow
+            1,             // bib number
+            [0, 0, 0],     // black text
+        );
+        let (jersey_view, jersey_sampler) = self.renderer.create_gpu_texture(&jersey_rgba, jw, jh);
+
+        let parts: Vec<CyclistMeshPart> = cyclist_parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 2 {
+                    // Jersey — textured with bib number
+                    let mat = self.renderer.create_textured_cyclist_material(
+                        [1.0, 0.75, 0.0, 1.0],
+                        &jersey_view,
+                        &jersey_sampler,
+                    );
+                    return CyclistMeshPart {
+                        mesh: GpuMesh::from_cpu(&self.renderer.device, &part.mesh),
+                        material_bind_group: mat,
+                        pipeline: CyclistPipeline::Textured,
+                    };
+                }
+                if i == 3 {
+                    // Skin — realistic skin shader
+                    let mat = self.renderer.create_cyclist_material([0.87, 0.67, 0.50, 0.0], None, None);
+                    return CyclistMeshPart {
+                        mesh: GpuMesh::from_cpu(&self.renderer.device, &part.mesh),
+                        material_bind_group: mat,
+                        pipeline: CyclistPipeline::Skin,
+                    };
+                }
+                let mat = match i {
+                    0 => self.renderer.create_cyclist_material([0.02, 0.02, 0.02, 1.0], None, None),
+                    1 => self.renderer.create_cyclist_material([0.12, 0.12, 0.14, 1.0], None, None),
+                    4 => self.renderer.create_cyclist_material([0.95, 0.95, 0.95, 1.0], None, None),
+                    5 => self.renderer.create_cyclist_material([0.03, 0.03, 0.03, 1.0], None, None),
+                    6 => self.renderer.create_cyclist_material([0.04, 0.04, 0.05, 1.0], None, None),
+                    7 => self.renderer.create_cyclist_material(
+                        part.default_color, Some(frame_yellow), Some(ultegra_silver),
+                    ),
+                    8 => self.renderer.create_cyclist_material(
+                        part.default_color, Some(frame_yellow), Some(ultegra_dark),
+                    ),
+                    _ => self.renderer.create_cyclist_material(part.default_color, None, None),
+                };
+                CyclistMeshPart {
+                    mesh: GpuMesh::from_cpu(&self.renderer.device, &part.mesh),
+                    material_bind_group: mat,
+                    pipeline: CyclistPipeline::Solid,
+                }
+            })
+            .collect();
+
+        self.cyclist_models = vec![CyclistModel {
+            parts,
             instance_buffer: cyclist_buf,
             instance_count: cyclist_count,
-            material_bind_group: cyclist_mat,
         }];
     }
 
@@ -689,7 +960,7 @@ impl AppInner {
         self.renderer.update_camera(&self.camera, 0.0);
         self.renderer.update_hud(&hud_verts, &hud_indices);
 
-        match self.renderer.render(&[], &[], &[], &[], &[], &[], self.sky_color, &[]) {
+        match self.renderer.render(&[], &[], &[], &[], &[], &[], &[], &[], self.sky_color, &[], &[]) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
                 let (w, h) = (self.renderer.width, self.renderer.height);
@@ -756,6 +1027,29 @@ impl AppInner {
             self.renderer.height as f32,
         );
 
+        // Update grass blade instances when camera moves along route
+        if let Some(ref blade_config) = self.grass_blade_config {
+            if (dist - self.grass_blade_last_dist).abs() > 3.0 && !self.grass_blade_draws.is_empty() {
+                let blades = grass_blades::generate_blade_instances(
+                    &self.route_points,
+                    blade_config,
+                    dist as f64,
+                    self.dem_for_grass.as_ref(),
+                    self.terrain_half_width,
+                    self.terrain_falloff,
+                );
+                self.grass_blade_draws[0].instance_count = blades.len() as u32;
+                if !blades.is_empty() {
+                    self.renderer.queue.write_buffer(
+                        &self.grass_blade_draws[0].instance_buffer,
+                        0,
+                        bytemuck::cast_slice(&blades),
+                    );
+                }
+                self.grass_blade_last_dist = dist;
+            }
+        }
+
         // Update flying animal positions
         for (cpu_data, draw) in self.flying_cpu.iter_mut().zip(self.animated_draws.iter()) {
             if cpu_data.is_empty() {
@@ -782,34 +1076,42 @@ impl AppInner {
         );
         // Add player cyclist (visible in 3rd-person modes)
         if self.camera_mode != CameraMode::FirstPerson {
+            let player_pedal_phase = (dist / 5.3) * std::f32::consts::TAU;
             self.cyclist_cpu.push(CyclistInstanceData {
-                position: [px, elev_here, pz],
+                position: [px, elev_here + 0.08, pz],
                 scale: 1.0,
                 forward: [fx, fz],
-                pedal_phase: 0.0,
+                pedal_phase: player_pedal_phase,
                 _pad: 0.0,
             });
         }
-        if !self.cyclist_draws.is_empty() {
-            self.cyclist_draws[0].instance_count = self.cyclist_cpu.len() as u32;
+        if !self.cyclist_models.is_empty() {
+            self.cyclist_models[0].instance_count = self.cyclist_cpu.len() as u32;
             self.renderer.queue.write_buffer(
-                &self.cyclist_draws[0].instance_buffer,
+                &self.cyclist_models[0].instance_buffer,
                 0,
                 bytemuck::cast_slice(&self.cyclist_cpu),
             );
         }
+
+        // Update skeleton bone matrices (CPU skinning → GPU storage buffer)
+        self.skeleton_system.update(&self.cyclist_cpu);
+        self.renderer.update_bone_matrices(&self.skeleton_system.gpu_matrices);
 
         self.renderer.update_hud(&hud_verts, &hud_indices);
 
         match self.renderer.render(
             &self.draws,
             &self.road_draws,
+            &self.grass_shell_draws,
+            &self.grass_blade_draws,
             &self.instanced_draws,
             &self.animated_draws,
-            &self.cyclist_draws,
+            &self.cyclist_models,
             &self.water_draws,
             self.sky_color,
             &self.emissive_instanced_draws,
+            &self.tree_models,
         ) {
             Ok(_) => {}
             Err(wgpu::SurfaceError::Lost) => {
@@ -849,11 +1151,14 @@ impl AppInner {
         match self.renderer.render(
             &self.draws,
             &self.road_draws,
+            &[],
+            &[],
             &self.instanced_draws,
             &self.animated_draws,
             &[],
             &self.water_draws,
             self.sky_color,
+            &[],
             &[],
         ) {
             Ok(_) => {}

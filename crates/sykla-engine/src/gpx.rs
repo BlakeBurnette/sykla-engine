@@ -1,3 +1,4 @@
+use crate::dem::GeoOrigin;
 use crate::terrain::{RoutePoint, SurfaceType};
 
 struct GpsPoint {
@@ -65,14 +66,18 @@ struct TrackSegment {
 /// Split projected points into continuous segments, filtering out gaps > MAX_SEGMENT_DIST.
 /// Then concatenate all segments end-to-end into a single clean polyline, adjusting positions
 /// so each segment starts where the previous one ended.
-fn stitch_segments(projected: &[(f64, f64)]) -> (Vec<(f64, f64)>, f64) {
+/// Returns (stitched_points, original_points, total_length).
+/// `original_points` preserves the real GPS-projected coordinates for DEM sampling.
+fn stitch_segments(projected: &[(f64, f64)]) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, f64) {
     if projected.len() < 2 {
-        return (projected.to_vec(), 0.0);
+        return (projected.to_vec(), projected.to_vec(), 0.0);
     }
 
-    // Step 1: Split into continuous segments
+    // Step 1: Split into continuous segments, tracking original indices
     let mut segments: Vec<TrackSegment> = Vec::new();
+    let mut seg_indices: Vec<Vec<usize>> = Vec::new();
     let mut cur_points = vec![projected[0]];
+    let mut cur_indices = vec![0usize];
     let mut cur_len = 0.0;
 
     for i in 1..projected.len() {
@@ -83,22 +88,25 @@ fn stitch_segments(projected: &[(f64, f64)]) -> (Vec<(f64, f64)>, f64) {
         if dist <= MAX_SEGMENT_DIST {
             cur_len += dist;
             cur_points.push(projected[i]);
+            cur_indices.push(i);
         } else {
-            // Gap — save current segment if long enough
             if cur_len >= MIN_SEGMENT_LEN && cur_points.len() >= 2 {
+                seg_indices.push(std::mem::take(&mut cur_indices));
                 segments.push(TrackSegment {
                     points: std::mem::take(&mut cur_points),
                     length: cur_len,
                 });
             } else {
                 cur_points.clear();
+                cur_indices.clear();
             }
             cur_points.push(projected[i]);
+            cur_indices.push(i);
             cur_len = 0.0;
         }
     }
-    // Final segment
     if cur_len >= MIN_SEGMENT_LEN && cur_points.len() >= 2 {
+        seg_indices.push(cur_indices);
         segments.push(TrackSegment {
             points: cur_points,
             length: cur_len,
@@ -106,26 +114,25 @@ fn stitch_segments(projected: &[(f64, f64)]) -> (Vec<(f64, f64)>, f64) {
     }
 
     if segments.is_empty() {
-        return (vec![], 0.0);
+        return (vec![], vec![], 0.0);
     }
 
-    // Step 2: Stitch segments end-to-end
-    // Each segment keeps its internal shape but is translated so its start point
-    // connects to the end point of the previous segment, with a smooth transition.
+    // Step 2: Stitch segments end-to-end, preserving original coordinates
     let mut result = Vec::new();
+    let mut originals = Vec::new();
     let mut total_len = 0.0;
 
     for (seg_idx, seg) in segments.iter().enumerate() {
+        let indices = &seg_indices[seg_idx];
+
         if seg_idx == 0 {
-            // First segment: use as-is, origin at its first point
             let origin = seg.points[0];
-            for p in &seg.points {
+            for (k, p) in seg.points.iter().enumerate() {
                 result.push((p.0 - origin.0, p.1 - origin.1));
+                originals.push(projected[indices[k]]);
             }
         } else {
-            // Subsequent segments: translate so start aligns with end of result
             let prev_end = *result.last().unwrap();
-            // Direction from end of result — use last segment of previous polyline
             let prev_dir = if result.len() >= 2 {
                 let a = result[result.len() - 2];
                 let b = result[result.len() - 1];
@@ -137,24 +144,24 @@ fn stitch_segments(projected: &[(f64, f64)]) -> (Vec<(f64, f64)>, f64) {
                 (0.0, 1.0)
             };
 
-            // Offset: place segment start slightly ahead along the previous direction
-            let gap = 10.0; // 10m gap to connect segments smoothly
+            let gap = 10.0;
             let connect_x = prev_end.0 + prev_dir.0 * gap;
             let connect_z = prev_end.1 + prev_dir.1 * gap;
 
             let seg_origin = seg.points[0];
-            for p in &seg.points {
+            for (k, p) in seg.points.iter().enumerate() {
                 result.push((
                     (p.0 - seg_origin.0) + connect_x,
                     (p.1 - seg_origin.1) + connect_z,
                 ));
+                originals.push(projected[indices[k]]);
             }
             total_len += gap;
         }
         total_len += seg.length;
     }
 
-    (result, total_len)
+    (result, originals, total_len)
 }
 
 /// Interpolate position along a polyline at a given cumulative distance.
@@ -211,19 +218,21 @@ fn interpolate_elevation(waypoints: &[(f64, f64)], d: f64) -> f64 {
 pub fn generate_from_gpx(
     gpx_data: &str,
     elevation_waypoints: &[(f64, f64)],
-) -> Vec<RoutePoint> {
+) -> (Vec<RoutePoint>, Option<GeoOrigin>) {
     let gps = parse_gpx(gpx_data);
     if gps.len() < 2 {
-        return vec![];
+        return (vec![], None);
     }
 
+    let geo_origin = GeoOrigin::new(gps[0].lat, gps[0].lng);
     let all_projected = project(&gps);
 
     // Stitch together all continuous trail segments (removing driving gaps)
-    let (projected, _stitched_len) = stitch_segments(&all_projected);
+    // `originals` preserves pre-stitch GPS coordinates for DEM sampling
+    let (projected, originals, _stitched_len) = stitch_segments(&all_projected);
 
     if projected.len() < 2 {
-        return vec![];
+        return (vec![], None);
     }
 
     // Compute cumulative distance along stitched path
@@ -243,8 +252,11 @@ pub fn generate_from_gpx(
     for i in 0..num_points {
         let d = (i as f64 * 5.0).min(gps_total);
 
-        // Interpolate 2D position from GPS path
+        // Interpolate 2D position from stitched path (for rendering)
         let (px, pz) = interp_pos(&projected, &cum_dist, d);
+
+        // Interpolate original GPS position (for DEM sampling)
+        let (gx, gz) = interp_pos(&originals, &cum_dist, d);
 
         // Map GPS distance to elevation distance domain and interpolate
         let elev_d = d / gps_total * elev_total;
@@ -268,8 +280,11 @@ pub fn generate_from_gpx(
             forward_x: fx / len,
             forward_z: fz / len,
             surface: SurfaceType::Paved,
+            banking: 0.0,
+            geo_x: gx as f32,
+            geo_z: gz as f32,
         });
     }
 
-    points
+    (points, Some(geo_origin))
 }

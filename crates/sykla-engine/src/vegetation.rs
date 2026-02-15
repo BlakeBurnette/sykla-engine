@@ -1,5 +1,5 @@
 use crate::mesh::{CpuMesh, Vertex};
-use crate::terrain::{RoutePoint, interpolate_point, offset_position};
+use crate::terrain::{RoutePoint, DemTerrainSource, interpolate_point_geo, offset_position, procedural_terrain_y};
 use bytemuck::{Pod, Zeroable};
 use std::f32::consts::{PI, TAU};
 
@@ -19,6 +19,34 @@ impl InstanceData {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<InstanceData>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
+/// Instance data for textured GLB trees — includes Y rotation and fallen flag.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct TreeInstanceData {
+    pub position: [f32; 3],
+    pub scale: f32,
+    pub rotation_y: f32,
+    pub flags: f32,       // 0.0 = upright, 1.0 = fallen (~82deg tilt)
+    pub _pad: [f32; 2],
+}
+
+impl TreeInstanceData {
+    const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        3 => Float32x3,
+        4 => Float32,
+        5 => Float32,
+        6 => Float32,
+    ];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TreeInstanceData>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &Self::ATTRS,
         }
@@ -420,6 +448,10 @@ pub struct VegetationConfig {
     /// Trees are fully absent above treeline + 200m.
     /// Default 99999.0 = no treeline (all vegetation placed normally).
     pub treeline: f32,
+    /// Use textured GLB tree species (oak, loblolly pine, redbud) instead of procedural trees.
+    pub use_eastern_species: bool,
+    /// Probability (0.0–1.0) that a tree is placed fallen. Only used with eastern species.
+    pub fallen_tree_probability: f32,
 }
 
 impl Default for VegetationConfig {
@@ -432,6 +464,8 @@ impl Default for VegetationConfig {
             min_scale: 0.7,
             max_scale: 1.15,
             treeline: 99999.0,
+            use_eastern_species: false,
+            fallen_tree_probability: 0.0,
         }
     }
 }
@@ -450,14 +484,29 @@ pub struct PlacementResult {
     pub bush: Vec<InstanceData>,
     pub young_deciduous: Vec<InstanceData>,
     pub young_pine: Vec<InstanceData>,
+    // Eastern GLB species (only populated when use_eastern_species is true)
+    pub oaks: Vec<TreeInstanceData>,
+    pub loblolly_pines: Vec<TreeInstanceData>,
+    pub redbuds: Vec<TreeInstanceData>,
+    pub fallen_trees: Vec<TreeInstanceData>,
 }
 
-pub fn place_vegetation(points: &[RoutePoint], config: &VegetationConfig) -> PlacementResult {
+pub fn place_vegetation(
+    points: &[RoutePoint],
+    config: &VegetationConfig,
+    dem: Option<&DemTerrainSource>,
+    terrain_half_width: f32,
+    terrain_falloff: f32,
+) -> PlacementResult {
     let mut deciduous = Vec::new();
     let mut pine = Vec::new();
     let mut bush = Vec::new();
     let mut young_deciduous = Vec::new();
     let mut young_pine = Vec::new();
+    let mut oaks = Vec::new();
+    let mut loblolly_pines = Vec::new();
+    let mut redbuds = Vec::new();
+    let mut fallen_trees = Vec::new();
     let mut rng: u64 = 42;
 
     let total_dist = points.last().map(|p| p.distance_m).unwrap_or(0.0);
@@ -468,16 +517,28 @@ pub fn place_vegetation(points: &[RoutePoint], config: &VegetationConfig) -> Pla
 
         for _ in 0..config.trees_per_slot {
             for side in [-1.0_f32, 1.0] {
-                place_one(
-                    points, config, &mut rng, base_z, side,
-                    &mut deciduous, &mut pine, &mut bush,
-                    &mut young_deciduous, &mut young_pine,
-                );
+                if config.use_eastern_species {
+                    place_one_eastern(
+                        points, config, &mut rng, base_z, side,
+                        &mut oaks, &mut loblolly_pines, &mut redbuds,
+                        &mut fallen_trees, dem, terrain_half_width, terrain_falloff,
+                    );
+                } else {
+                    place_one(
+                        points, config, &mut rng, base_z, side,
+                        &mut deciduous, &mut pine, &mut bush,
+                        &mut young_deciduous, &mut young_pine, dem,
+                        terrain_half_width, terrain_falloff,
+                    );
+                }
             }
         }
     }
 
-    PlacementResult { deciduous, pine, bush, young_deciduous, young_pine }
+    PlacementResult {
+        deciduous, pine, bush, young_deciduous, young_pine,
+        oaks, loblolly_pines, redbuds, fallen_trees,
+    }
 }
 
 fn place_one(
@@ -491,6 +552,9 @@ fn place_one(
     bush: &mut Vec<InstanceData>,
     young_deciduous: &mut Vec<InstanceData>,
     young_pine: &mut Vec<InstanceData>,
+    dem: Option<&DemTerrainSource>,
+    terrain_half_width: f32,
+    terrain_falloff: f32,
 ) {
     let x_off = config.min_distance + next_rng(rng) * (config.max_distance - config.min_distance);
     let z_jitter = (next_rng(rng) - 0.5) * config.spacing_m * 0.9;
@@ -498,8 +562,16 @@ fn place_one(
     let age = next_rng(rng); // 0 = young, 1 = mature
 
     let dist_along = base_z + z_jitter as f64;
-    let (px, pz, y, fx, fz) = interpolate_point(points, dist_along);
+    let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
     let (wx, wz) = offset_position(px, pz, fx, fz, side * x_off);
+
+    // Use DEM elevation at tree position if available (matches terrain mesh)
+    // Otherwise apply procedural terrain falloff to match the terrain mesh
+    let y = if let Some(dem) = dem {
+        dem.sample_at(gx, gz, fx, fz, side * x_off).unwrap_or(y)
+    } else {
+        procedural_terrain_y(y, side * x_off, terrain_half_width, terrain_falloff, wx, wz)
+    };
 
     // Treeline thinning: above treeline + 200m → skip entirely
     // Between treeline and treeline + 200m → probabilistic thinning
@@ -543,5 +615,87 @@ fn place_one(
         // Bush / understory
         let scale = 0.5 + next_rng(rng) * 1.0;
         bush.push(InstanceData { position: [wx, y, wz], scale });
+    }
+}
+
+fn place_one_eastern(
+    points: &[RoutePoint],
+    config: &VegetationConfig,
+    rng: &mut u64,
+    base_z: f64,
+    side: f32,
+    oaks: &mut Vec<TreeInstanceData>,
+    loblolly_pines: &mut Vec<TreeInstanceData>,
+    redbuds: &mut Vec<TreeInstanceData>,
+    fallen_trees: &mut Vec<TreeInstanceData>,
+    dem: Option<&DemTerrainSource>,
+    terrain_half_width: f32,
+    terrain_falloff: f32,
+) {
+    let x_off = config.min_distance + next_rng(rng) * (config.max_distance - config.min_distance);
+    let z_jitter = (next_rng(rng) - 0.5) * config.spacing_m * 0.9;
+    let kind = next_rng(rng);
+    let rotation_y = next_rng(rng) * TAU;
+
+    let dist_along = base_z + z_jitter as f64;
+    let (px, pz, y, fx, fz, gx, gz) = interpolate_point_geo(points, dist_along);
+    let (wx, wz) = offset_position(px, pz, fx, fz, side * x_off);
+
+    // Use DEM elevation at tree position if available (matches terrain mesh)
+    // Otherwise apply procedural terrain falloff to match the terrain mesh
+    let y = if let Some(dem) = dem {
+        dem.sample_at(gx, gz, fx, fz, side * x_off).unwrap_or(y)
+    } else {
+        procedural_terrain_y(y, side * x_off, terrain_half_width, terrain_falloff, wx, wz)
+    };
+
+    // Treeline thinning
+    if y > config.treeline + 200.0 {
+        return;
+    }
+    if y > config.treeline {
+        let thin_t = (y - config.treeline) / 200.0;
+        if next_rng(rng) < thin_t {
+            return;
+        }
+    }
+
+    // Fallen tree check
+    let fallen = config.fallen_tree_probability > 0.0 && next_rng(rng) < config.fallen_tree_probability;
+    let flags = if fallen { 1.0 } else { 0.0 };
+
+    if kind < 0.10 {
+        // Redbud — understory, smaller scale, closer to road
+        let scale = 0.6 + next_rng(rng) * 0.4;
+        let inst = TreeInstanceData {
+            position: [wx, y, wz],
+            scale,
+            rotation_y,
+            flags,
+            _pad: [0.0; 2],
+        };
+        if fallen { fallen_trees.push(inst); } else { redbuds.push(inst); }
+    } else if kind < 0.45 {
+        // Oak — 35% of canopy trees
+        let scale = config.min_scale + next_rng(rng) * (config.max_scale - config.min_scale);
+        let inst = TreeInstanceData {
+            position: [wx, y, wz],
+            scale,
+            rotation_y,
+            flags,
+            _pad: [0.0; 2],
+        };
+        if fallen { fallen_trees.push(inst); } else { oaks.push(inst); }
+    } else {
+        // Loblolly pine — 55% of canopy trees
+        let scale = config.min_scale + next_rng(rng) * (config.max_scale - config.min_scale);
+        let inst = TreeInstanceData {
+            position: [wx, y, wz],
+            scale,
+            rotation_y,
+            flags,
+            _pad: [0.0; 2],
+        };
+        if fallen { fallen_trees.push(inst); } else { loblolly_pines.push(inst); }
     }
 }

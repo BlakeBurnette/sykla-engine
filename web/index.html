@@ -102,6 +102,11 @@
             import('./dist/sykla_web.js').then(m => m.default()).then(() => {
                 document.getElementById('status').textContent = '';
             }).catch(err => {
+                // winit uses exceptions for control flow on web — this is expected
+                if (err && String(err).includes('Using exceptions for control flow')) {
+                    document.getElementById('status').textContent = '';
+                    return;
+                }
                 console.error('WASM init error:', err);
                 document.getElementById('status').textContent = 'Error: ' + err;
             });

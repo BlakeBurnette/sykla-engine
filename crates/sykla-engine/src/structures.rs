@@ -159,13 +159,13 @@ pub fn place_cabins(
     instances
 }
 
-/// Generate a snow bank mesh: low elongated mound.
+/// Generate a snow bank mesh: low flat plowed-snow mound along road edge.
 pub fn generate_snow_bank() -> CpuMesh {
-    // Squashed ellipsoid: ~0.5m tall, 1.5m wide, 3m long
-    let segments = 8;
-    let rings = 4;
-    let rx = 0.75_f32; // half-width
-    let ry = 0.5_f32;  // height
+    // Very flat ellipsoid: ~0.2m tall, 0.5m wide, 1.5m long
+    let segments = 6;
+    let rings = 3;
+    let rx = 0.5_f32;  // half-width
+    let ry = 0.2_f32;  // height — very low
     let rz = 1.5_f32;  // half-length
 
     let mut vertices = Vec::new();
@@ -217,7 +217,7 @@ pub fn place_snow_banks(
     road_half_width: f32,
     snow_start_elev: f32,
 ) -> Vec<InstanceData> {
-    let spacing = 4.0_f32;
+    let spacing = 8.0_f32; // Every 8m — continuous but not cluttered
     let mut instances = Vec::new();
     let mut next_dist = 0.0_f32;
 
@@ -235,7 +235,7 @@ pub fn place_snow_banks(
 
         let perp_x = -p.forward_z;
         let perp_z = p.forward_x;
-        let offset = road_half_width + 1.0;
+        let offset = road_half_width + 0.6; // Tight against road edge
 
         for &side in &[-1.0_f32, 1.0] {
             let x = p.pos_x + perp_x * offset * side;

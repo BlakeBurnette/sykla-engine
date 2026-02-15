@@ -3,6 +3,9 @@ name = "sykla-engine"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+dem = []
+
 [lib]
 name = "sykla_engine"
 path = "src/lib.rs"
@@ -13,6 +16,9 @@ winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.29"
 log = "0.4"
+png = "0.17"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.4"

@@ -26,24 +26,34 @@ pub fn generate_road(points: &[RoutePoint], config: &RoadConfig) -> CpuMesh {
         let perp_x = -point.forward_z;
         let perp_z = point.forward_x;
 
-        // Left edge
+        let banking = point.banking;
+        let cos_b = banking.cos();
+        let sin_b = banking.sin();
+        let hw_horizontal = config.half_width * cos_b;
+
+        // Normal tilted by banking angle (rotated around forward axis)
+        let nx = -perp_x * sin_b;
+        let ny = cos_b;
+        let nz = -perp_z * sin_b;
+
+        // Left edge (lower when banking > 0)
         vertices.push(Vertex {
             position: [
-                point.pos_x + perp_x * (-config.half_width),
-                y,
-                point.pos_z + perp_z * (-config.half_width),
+                point.pos_x + perp_x * (-hw_horizontal),
+                y - config.half_width * sin_b,
+                point.pos_z + perp_z * (-hw_horizontal),
             ],
-            normal: [0.0, 1.0, 0.0],
+            normal: [nx, ny, nz],
             uv: [0.0, v],
         });
-        // Right edge
+        // Right edge (higher when banking > 0)
         vertices.push(Vertex {
             position: [
-                point.pos_x + perp_x * config.half_width,
-                y,
-                point.pos_z + perp_z * config.half_width,
+                point.pos_x + perp_x * hw_horizontal,
+                y + config.half_width * sin_b,
+                point.pos_z + perp_z * hw_horizontal,
             ],
-            normal: [0.0, 1.0, 0.0],
+            normal: [nx, ny, nz],
             uv: [1.0, v],
         });
     }
