@@ -41,6 +41,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+const CHUNK_THRESHOLD: usize = 10_000;
+const WINDOW_SIZE: usize = 5_000;
+const REBUILD_MARGIN: usize = 1_000;
+
 #[derive(PartialEq)]
 enum AppState {
     Selecting,
@@ -67,6 +71,10 @@ struct App {
     dem_for_grass: Option<DemTerrainSource>,
     terrain_half_width: f32,
     terrain_falloff: f32,
+    // Terrain windowing (for long routes)
+    window_start: usize,
+    window_end: usize,
+    uses_windowing: bool,
     // CPU copies for per-frame position updates
     flying_cpu: Vec<Vec<AnimatedInstanceData>>,
     cyclist_cpu: Vec<CyclistInstanceData>,
@@ -114,6 +122,9 @@ impl App {
             dem_for_grass: None,
             terrain_half_width: 300.0,
             terrain_falloff: 0.08,
+            window_start: 0,
+            window_end: 0,
+            uses_windowing: false,
             flying_cpu: Vec::new(),
             cyclist_cpu: Vec::new(),
             npc_cyclists: Vec::new(),
@@ -151,6 +162,10 @@ impl App {
         self.physics_state = PhysicsState::default();
         self.rider_state = RiderRouteState::new(&self.route_points);
         log::info!("Loaded route: {} ({:.1} km, {:?})", cat[index].name, self.route_length / 1000.0, self.rider_state.topology);
+        let n = self.route_points.len();
+        self.uses_windowing = n > CHUNK_THRESHOLD;
+        self.window_start = 0;
+        self.window_end = if self.uses_windowing { WINDOW_SIZE.min(n) } else { n };
     }
 
     fn build_world(&mut self) {
@@ -192,26 +207,9 @@ impl App {
             }
         }
 
-        let is_dem = dem_source.is_some();
         let terrain_config = style.terrain_config(dem_source);
         self.terrain_half_width = terrain_config.half_width;
         self.terrain_falloff = terrain_config.falloff;
-        let terrain_mesh = generate_terrain(&self.route_points, &terrain_config);
-        let ground_half = if is_dem { 3000.0 } else { 1000.0 };
-        let ground_mesh = generate_ground_plane(&self.route_points, ground_half);
-        let road_segments = generate_roads_by_surface(&self.route_points, &RoadConfig::default());
-
-        let terrain_gpu = GpuMesh::from_cpu(&renderer.device, &terrain_mesh);
-        let ground_gpu = GpuMesh::from_cpu(&renderer.device, &ground_mesh);
-
-        let terrain_mat = renderer.create_terrain_material(
-            style.terrain_color,
-            style.terrain_mid_color,
-            style.terrain_high_color,
-            style.elevation_zones,
-            style.terrain_params,
-        );
-        let ground_mat = renderer.create_material(style.ground_color);
 
         // Set lighting, fog, and sky from route style
         renderer.set_light_direction_uniform(style.light_direction);
@@ -223,64 +221,6 @@ impl App {
             self.sky_state.latitude = origin.lat0 as f32;
         }
 
-        self.draws = vec![
-            DrawCall {
-                mesh: ground_gpu,
-                material_bind_group: ground_mat,
-            },
-            DrawCall {
-                mesh: terrain_gpu,
-                material_bind_group: terrain_mat,
-            },
-        ];
-
-        // Mountains — background ring of peaks using terrain material
-        if style.mountains {
-            let mountain_mesh = if is_dem {
-                generate_mountain_ring_with_radius(&self.route_points, 4000.0)
-            } else {
-                generate_mountain_ring(&self.route_points)
-            };
-            if !mountain_mesh.vertices.is_empty() {
-                let mountain_gpu = GpuMesh::from_cpu(&renderer.device, &mountain_mesh);
-                let mountain_mat = renderer.create_terrain_material(
-                    style.terrain_color,
-                    style.terrain_mid_color,
-                    style.terrain_high_color,
-                    style.elevation_zones,
-                    [0.0; 4], // mountains don't use terrain splatting
-                );
-                self.draws.push(DrawCall {
-                    mesh: mountain_gpu,
-                    material_bind_group: mountain_mat,
-                });
-            }
-        }
-
-        // Road segments — separate draw list with depth-biased pipeline
-        let has_markings = style.road_markings == RoadMarkings::European;
-        self.road_draws = Vec::new();
-        for (mesh, surface) in &road_segments {
-            let color = match surface {
-                SurfaceType::Paved => style.road_color,
-                SurfaceType::Gravel => style.gravel_color,
-            };
-            let gpu = GpuMesh::from_cpu(&renderer.device, mesh);
-            let is_gravel = matches!(surface, SurfaceType::Gravel);
-            let mat = renderer.create_road_material(color, has_markings, is_gravel);
-            self.road_draws.push(DrawCall {
-                mesh: gpu,
-                material_bind_group: mat,
-            });
-        }
-
-        // Debug: log road mesh info
-        let road_total_verts: usize = road_segments.iter().map(|(m, _)| m.vertices.len()).sum();
-        let road_total_idx: usize = road_segments.iter().map(|(m, _)| m.indices.len()).sum();
-        log::info!(
-            "Road: {} segments, {} vertices, {} indices",
-            road_segments.len(), road_total_verts, road_total_idx,
-        );
         // Log path extent to verify winding
         if !self.route_points.is_empty() {
             let mut min_x = f32::MAX;
@@ -299,20 +239,6 @@ impl App {
                 min_z, max_z, max_z - min_z,
             );
         }
-
-        // --- Grass shells (volumetric grass on terrain) ---
-        let mut grass_shell_draws = Vec::new();
-        if let Some(grass_params) = grass::GrassParams::for_biome(style.terrain_params[3]) {
-            let grass_mesh = GpuMesh::from_cpu(&renderer.device, &terrain_mesh);
-            let grass_mat = renderer.create_grass_material(&grass_params);
-            grass_shell_draws.push(GrassShellDraw {
-                mesh: grass_mesh,
-                material_bind_group: grass_mat,
-                num_shells: grass_params.num_shells,
-            });
-            log::info!("Grass: {} shells, height={:.3}m", grass_params.num_shells, grass_params.shell_height);
-        }
-        self.grass_shell_draws = grass_shell_draws;
 
         // --- Grass blades (instanced individual blades near camera) ---
         self.grass_blade_draws.clear();
@@ -357,269 +283,6 @@ impl App {
                 material_bind_group: blade_mat,
             });
             log::info!("Grass blades: {} initial instances", blade_count);
-        }
-
-        // --- Vegetation (instanced) ---
-        let placement = place_vegetation(
-            &self.route_points, &style.vegetation, terrain_config.dem.as_ref(),
-            terrain_config.half_width, terrain_config.falloff,
-        );
-
-        self.instanced_draws = Vec::new();
-
-        // --- Textured GLB trees ---
-        self.tree_models.clear();
-        if style.vegetation.use_eastern_species {
-            let oak_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/oak.glb"));
-            let pine_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/loblolly_pine.glb"));
-            let redbud_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/redbud.glb"));
-
-            for (parts, instances) in [
-                (oak_parts, &placement.oaks),
-                (pine_parts, &placement.loblolly_pines),
-                (redbud_parts, &placement.redbuds),
-            ] {
-                if !instances.is_empty() {
-                    let buf = renderer.create_tree_instance_buffer(instances);
-                    self.tree_models.push(TreeModel {
-                        parts,
-                        instance_buffer: buf,
-                        instance_count: instances.len() as u32,
-                    });
-                }
-            }
-            // Fallen trees use oak mesh
-            if !placement.fallen_trees.is_empty() {
-                let fallen_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/oak.glb"));
-                let buf = renderer.create_tree_instance_buffer(&placement.fallen_trees);
-                self.tree_models.push(TreeModel {
-                    parts: fallen_parts,
-                    instance_buffer: buf,
-                    instance_count: placement.fallen_trees.len() as u32,
-                });
-            }
-            log::info!(
-                "Eastern trees: {} oaks, {} pines, {} redbuds, {} fallen",
-                placement.oaks.len(), placement.loblolly_pines.len(),
-                placement.redbuds.len(), placement.fallen_trees.len(),
-            );
-            // Debug: log GLB tree model details
-            for (i, model) in self.tree_models.iter().enumerate() {
-                log::info!(
-                    "  TreeModel[{}]: {} parts, {} instances",
-                    i, model.parts.len(), model.instance_count,
-                );
-                for (j, part) in model.parts.iter().enumerate() {
-                    log::info!(
-                        "    Part[{}]: {} indices",
-                        j, part.mesh.num_indices,
-                    );
-                }
-            }
-        }
-
-        // --- Water features ---
-        let water_features = detect_water_features(&self.route_points);
-        let water_mat = renderer.create_material([0.05, 0.12, 0.18, 0.85]);
-
-        self.water_draws = water_features
-            .iter()
-            .map(|wf| {
-                let mesh = generate_water_mesh(wf, &self.route_points);
-                let gpu = GpuMesh::from_cpu(&renderer.device, &mesh);
-                DrawCall {
-                    mesh: gpu,
-                    material_bind_group: water_mat.clone(),
-                }
-            })
-            .collect();
-
-        log::info!("Water: {} features", water_features.len());
-
-        // --- Wildlife ---
-        let wildlife = place_wildlife(&self.route_points, &water_features, terrain_config.dem.as_ref());
-
-        // Ground animal meshes
-        let squirrel_mesh = GpuMesh::from_cpu(&renderer.device, &generate_squirrel());
-        let deer_mesh = GpuMesh::from_cpu(&renderer.device, &generate_deer());
-        let turkey_mesh = GpuMesh::from_cpu(&renderer.device, &generate_turkey());
-        let turtle_mesh = GpuMesh::from_cpu(&renderer.device, &generate_turtle());
-        let egret_mesh = GpuMesh::from_cpu(&renderer.device, &generate_egret());
-
-        // Ground animal materials
-        let squirrel_mat = renderer.create_material([0.40, 0.28, 0.15, 1.0]); // brown
-        let deer_mat = renderer.create_material([0.45, 0.35, 0.22, 1.0]); // tan
-        let turkey_mat = renderer.create_material([0.38, 0.26, 0.14, 1.0]); // warm brown-bronze
-        let turtle_mat = renderer.create_material([0.25, 0.30, 0.15, 1.0]); // dark green
-        let egret_mat = renderer.create_material([0.92, 0.90, 0.85, 1.0]); // white
-
-        // Ground animal instance buffers and draw calls
-        let squirrel_count = wildlife.squirrels.len() as u32;
-        let deer_count = wildlife.deer.len() as u32;
-        let turkey_count = wildlife.turkeys.len() as u32;
-        let turtle_count = wildlife.turtles.len() as u32;
-        let egret_count = wildlife.egrets.len() as u32;
-
-        if squirrel_count > 0 {
-            let buf = renderer.create_instance_buffer(&wildlife.squirrels);
-            self.instanced_draws.push(InstancedDrawCall {
-                mesh: squirrel_mesh,
-                instance_buffer: buf,
-                instance_count: squirrel_count,
-                material_bind_group: squirrel_mat,
-            });
-        }
-        if deer_count > 0 {
-            let buf = renderer.create_instance_buffer(&wildlife.deer);
-            self.instanced_draws.push(InstancedDrawCall {
-                mesh: deer_mesh,
-                instance_buffer: buf,
-                instance_count: deer_count,
-                material_bind_group: deer_mat,
-            });
-        }
-        if turkey_count > 0 {
-            let buf = renderer.create_instance_buffer(&wildlife.turkeys);
-            self.instanced_draws.push(InstancedDrawCall {
-                mesh: turkey_mesh,
-                instance_buffer: buf,
-                instance_count: turkey_count,
-                material_bind_group: turkey_mat,
-            });
-        }
-        if turtle_count > 0 {
-            let buf = renderer.create_instance_buffer(&wildlife.turtles);
-            self.instanced_draws.push(InstancedDrawCall {
-                mesh: turtle_mesh,
-                instance_buffer: buf,
-                instance_count: turtle_count,
-                material_bind_group: turtle_mat,
-            });
-        }
-        if egret_count > 0 {
-            let buf = renderer.create_instance_buffer(&wildlife.egrets);
-            self.instanced_draws.push(InstancedDrawCall {
-                mesh: egret_mesh,
-                instance_buffer: buf,
-                instance_count: egret_count,
-                material_bind_group: egret_mat,
-            });
-        }
-
-        log::info!(
-            "Ground animals: {} squirrels, {} deer, {} turkeys, {} turtles, {} egrets",
-            squirrel_count, deer_count, turkey_count, turtle_count, egret_count
-        );
-
-        // Flying animal meshes (parameterized birds)
-        let crow_cpu = generate_bird(0.06, 0.25, 0.08);
-        let hawk_cpu = generate_bird(0.10, 0.50, 0.12);
-        let starling_cpu = generate_small_bird();
-        let goose_cpu = generate_goose();
-
-        let crow_gpu = GpuMesh::from_cpu(&renderer.device, &crow_cpu);
-        let hawk_gpu = GpuMesh::from_cpu(&renderer.device, &hawk_cpu);
-        let starling_gpu = GpuMesh::from_cpu(&renderer.device, &starling_cpu);
-        let goose_gpu = GpuMesh::from_cpu(&renderer.device, &goose_cpu);
-
-        // Flying animal materials
-        let crow_mat = renderer.create_material([0.08, 0.08, 0.10, 1.0]); // near-black
-        let hawk_mat = renderer.create_material([0.35, 0.25, 0.15, 1.0]); // brown
-        let starling_mat = renderer.create_material([0.12, 0.12, 0.15, 1.0]); // dark grey
-        let goose_mat = renderer.create_material([0.40, 0.38, 0.32, 1.0]); // grey-brown
-
-        // Build animated draw calls + CPU copies for each flying group
-        let flying_groups: Vec<(Vec<AnimatedInstanceData>, GpuMesh, wgpu::BindGroup)> = vec![
-            (wildlife.crows, crow_gpu, crow_mat),
-            (wildlife.hawks, hawk_gpu, hawk_mat),
-            (wildlife.starlings, starling_gpu, starling_mat),
-            (wildlife.geese, goose_gpu, goose_mat),
-        ];
-
-        self.animated_draws.clear();
-        self.flying_cpu.clear();
-
-        let mut total_flying = 0u32;
-        for (cpu_data, mesh, mat) in flying_groups {
-            let count = cpu_data.len() as u32;
-            total_flying += count;
-            let buf = renderer.create_animated_instance_buffer(&cpu_data);
-            self.animated_draws.push(AnimatedDrawCall {
-                mesh,
-                instance_buffer: buf,
-                instance_count: count,
-                material_bind_group: mat,
-            });
-            self.flying_cpu.push(cpu_data);
-        }
-
-        log::info!(
-            "Flying animals: {} crows, {} hawks, {} starlings, {} geese = {} total",
-            self.flying_cpu[0].len(),
-            self.flying_cpu[1].len(),
-            self.flying_cpu[2].len(),
-            self.flying_cpu[3].len(),
-            total_flying,
-        );
-
-        // --- Cabins + Snow banks ---
-        self.emissive_instanced_draws.clear();
-        if style.cabin_spacing_m > 0.0 {
-            let cabin_body_mesh = structures::generate_cabin_body();
-            let cabin_window_mesh = structures::generate_cabin_windows();
-            let cabin_instances = structures::place_cabins(
-                &self.route_points,
-                style.vegetation.treeline,
-                style.cabin_spacing_m,
-            );
-            if !cabin_instances.is_empty() {
-                let body_gpu = GpuMesh::from_cpu(&renderer.device, &cabin_body_mesh);
-                let window_gpu = GpuMesh::from_cpu(&renderer.device, &cabin_window_mesh);
-                let body_mat = renderer.create_material([0.42, 0.26, 0.15, 1.0]); // #6B4226 timber
-                let window_mat = renderer.create_material([2.0, 1.44, 0.60, 1.0]); // #FFB84D amber glow
-                let body_buf = renderer.create_instance_buffer(&cabin_instances);
-                let window_buf = renderer.create_instance_buffer(&cabin_instances);
-                let count = cabin_instances.len() as u32;
-
-                self.instanced_draws.push(InstancedDrawCall {
-                    mesh: body_gpu,
-                    instance_buffer: body_buf,
-                    instance_count: count,
-                    material_bind_group: body_mat,
-                });
-                self.emissive_instanced_draws.push(InstancedDrawCall {
-                    mesh: window_gpu,
-                    instance_buffer: window_buf,
-                    instance_count: count,
-                    material_bind_group: window_mat,
-                });
-                log::info!("Cabins: {} placed", count);
-            }
-        }
-
-        // Snow banks (high_alpine_winter only — check if elevation_zones[0] suggests snow)
-        if style.elevation_zones[0] < 90000.0 {
-            let snow_start = style.elevation_zones[0];
-            let snow_instances = structures::place_snow_banks(
-                &self.route_points,
-                RoadConfig::default().half_width,
-                snow_start,
-            );
-            if !snow_instances.is_empty() {
-                let snow_mesh = structures::generate_snow_bank();
-                let snow_gpu = GpuMesh::from_cpu(&renderer.device, &snow_mesh);
-                let snow_mat = renderer.create_material([0.88, 0.90, 0.95, 1.0]);
-                let snow_buf = renderer.create_instance_buffer(&snow_instances);
-                let count = snow_instances.len() as u32;
-
-                self.instanced_draws.push(InstancedDrawCall {
-                    mesh: snow_gpu,
-                    instance_buffer: snow_buf,
-                    instance_count: count,
-                    material_bind_group: snow_mat,
-                });
-                log::info!("Snow banks: {} placed", count);
-            }
         }
 
         // --- Cyclists (multi-part colored model) ---
@@ -711,6 +374,415 @@ impl App {
         }];
 
         log::info!("Cyclists: {} NPCs", cyclist_count);
+
+        // Build initial terrain window
+        self.rebuild_terrain_window();
+    }
+
+    fn rebuild_terrain_window(&mut self) {
+        let window_points = &self.route_points[self.window_start..self.window_end];
+        let style = routes::route_style(self.current_key);
+
+        let renderer = match &self.renderer {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Reconstruct DEM source for terrain/vegetation
+        let dem_source = match (style.dem_data, &self.geo_origin) {
+            (Some(bytes), Some(origin)) => {
+                DemTile::from_bytes(bytes).map(|tile| DemTerrainSource { tile, origin: origin.clone() })
+            }
+            _ => None,
+        };
+        let is_dem = dem_source.is_some();
+        let terrain_config = style.terrain_config(dem_source);
+
+        // --- Terrain, ground plane ---
+        let terrain_mesh = generate_terrain(window_points, &terrain_config);
+        let ground_half = if is_dem { 3000.0 } else { 1000.0 };
+        let ground_mesh = generate_ground_plane(window_points, ground_half);
+        let road_segments = generate_roads_by_surface(window_points, &RoadConfig::default());
+
+        let terrain_gpu = GpuMesh::from_cpu(&renderer.device, &terrain_mesh);
+        let ground_gpu = GpuMesh::from_cpu(&renderer.device, &ground_mesh);
+
+        let terrain_mat = renderer.create_terrain_material(
+            style.terrain_color,
+            style.terrain_mid_color,
+            style.terrain_high_color,
+            style.elevation_zones,
+            style.terrain_params,
+        );
+        let ground_mat = renderer.create_material(style.ground_color);
+
+        self.draws = vec![
+            DrawCall {
+                mesh: ground_gpu,
+                material_bind_group: ground_mat,
+            },
+            DrawCall {
+                mesh: terrain_gpu,
+                material_bind_group: terrain_mat,
+            },
+        ];
+
+        // Mountains — background ring of peaks using terrain material
+        if style.mountains {
+            let mountain_mesh = if is_dem {
+                generate_mountain_ring_with_radius(window_points, 4000.0)
+            } else {
+                generate_mountain_ring(window_points)
+            };
+            if !mountain_mesh.vertices.is_empty() {
+                let mountain_gpu = GpuMesh::from_cpu(&renderer.device, &mountain_mesh);
+                let mountain_mat = renderer.create_terrain_material(
+                    style.terrain_color,
+                    style.terrain_mid_color,
+                    style.terrain_high_color,
+                    style.elevation_zones,
+                    [0.0; 4],
+                );
+                self.draws.push(DrawCall {
+                    mesh: mountain_gpu,
+                    material_bind_group: mountain_mat,
+                });
+            }
+        }
+
+        // Road segments — separate draw list with depth-biased pipeline
+        let has_markings = style.road_markings == RoadMarkings::European;
+        self.road_draws = Vec::new();
+        for (mesh, surface) in &road_segments {
+            let color = match surface {
+                SurfaceType::Paved => style.road_color,
+                SurfaceType::Gravel => style.gravel_color,
+            };
+            let gpu = GpuMesh::from_cpu(&renderer.device, mesh);
+            let is_gravel = matches!(surface, SurfaceType::Gravel);
+            let mat = renderer.create_road_material(color, has_markings, is_gravel);
+            self.road_draws.push(DrawCall {
+                mesh: gpu,
+                material_bind_group: mat,
+            });
+        }
+
+        // Debug: log road mesh info
+        let road_total_verts: usize = road_segments.iter().map(|(m, _)| m.vertices.len()).sum();
+        let road_total_idx: usize = road_segments.iter().map(|(m, _)| m.indices.len()).sum();
+        log::info!(
+            "Road: {} segments, {} vertices, {} indices",
+            road_segments.len(), road_total_verts, road_total_idx,
+        );
+
+        // --- Grass shells (volumetric grass on terrain) ---
+        let mut grass_shell_draws = Vec::new();
+        if let Some(grass_params) = grass::GrassParams::for_biome(style.terrain_params[3]) {
+            let grass_mesh = GpuMesh::from_cpu(&renderer.device, &terrain_mesh);
+            let grass_mat = renderer.create_grass_material(&grass_params);
+            grass_shell_draws.push(GrassShellDraw {
+                mesh: grass_mesh,
+                material_bind_group: grass_mat,
+                num_shells: grass_params.num_shells,
+            });
+            log::info!("Grass: {} shells, height={:.3}m", grass_params.num_shells, grass_params.shell_height);
+        }
+        self.grass_shell_draws = grass_shell_draws;
+
+        // --- Vegetation (instanced) ---
+        let placement = place_vegetation(
+            window_points, &style.vegetation, terrain_config.dem.as_ref(),
+            terrain_config.half_width, terrain_config.falloff,
+        );
+
+        self.instanced_draws = Vec::new();
+
+        // --- Textured GLB trees ---
+        self.tree_models.clear();
+        if style.vegetation.use_eastern_species {
+            let oak_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/oak.glb"));
+            let pine_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/loblolly_pine.glb"));
+            let redbud_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/redbud.glb"));
+
+            for (parts, instances) in [
+                (oak_parts, &placement.oaks),
+                (pine_parts, &placement.loblolly_pines),
+                (redbud_parts, &placement.redbuds),
+            ] {
+                if !instances.is_empty() {
+                    let buf = renderer.create_tree_instance_buffer(instances);
+                    self.tree_models.push(TreeModel {
+                        parts,
+                        instance_buffer: buf,
+                        instance_count: instances.len() as u32,
+                    });
+                }
+            }
+            // Fallen trees use oak mesh
+            if !placement.fallen_trees.is_empty() {
+                let fallen_parts = sykla_engine::trees::load_tree_species(renderer, include_bytes!("../../../assets/trees/oak.glb"));
+                let buf = renderer.create_tree_instance_buffer(&placement.fallen_trees);
+                self.tree_models.push(TreeModel {
+                    parts: fallen_parts,
+                    instance_buffer: buf,
+                    instance_count: placement.fallen_trees.len() as u32,
+                });
+            }
+            log::info!(
+                "Eastern trees: {} oaks, {} pines, {} redbuds, {} fallen",
+                placement.oaks.len(), placement.loblolly_pines.len(),
+                placement.redbuds.len(), placement.fallen_trees.len(),
+            );
+            // Debug: log GLB tree model details
+            for (i, model) in self.tree_models.iter().enumerate() {
+                log::info!(
+                    "  TreeModel[{}]: {} parts, {} instances",
+                    i, model.parts.len(), model.instance_count,
+                );
+                for (j, part) in model.parts.iter().enumerate() {
+                    log::info!(
+                        "    Part[{}]: {} indices",
+                        j, part.mesh.num_indices,
+                    );
+                }
+            }
+        }
+
+        // --- Water features ---
+        let water_features = detect_water_features(window_points);
+        let water_mat = renderer.create_material([0.05, 0.12, 0.18, 0.85]);
+
+        self.water_draws = water_features
+            .iter()
+            .map(|wf| {
+                let mesh = generate_water_mesh(wf, window_points);
+                let gpu = GpuMesh::from_cpu(&renderer.device, &mesh);
+                DrawCall {
+                    mesh: gpu,
+                    material_bind_group: water_mat.clone(),
+                }
+            })
+            .collect();
+
+        log::info!("Water: {} features", water_features.len());
+
+        // --- Wildlife ---
+        let wildlife = place_wildlife(window_points, &water_features, terrain_config.dem.as_ref());
+
+        // Ground animal meshes
+        let squirrel_mesh = GpuMesh::from_cpu(&renderer.device, &generate_squirrel());
+        let deer_mesh = GpuMesh::from_cpu(&renderer.device, &generate_deer());
+        let turkey_mesh = GpuMesh::from_cpu(&renderer.device, &generate_turkey());
+        let turtle_mesh = GpuMesh::from_cpu(&renderer.device, &generate_turtle());
+        let egret_mesh = GpuMesh::from_cpu(&renderer.device, &generate_egret());
+
+        // Ground animal materials
+        let squirrel_mat = renderer.create_material([0.40, 0.28, 0.15, 1.0]);
+        let deer_mat = renderer.create_material([0.45, 0.35, 0.22, 1.0]);
+        let turkey_mat = renderer.create_material([0.38, 0.26, 0.14, 1.0]);
+        let turtle_mat = renderer.create_material([0.25, 0.30, 0.15, 1.0]);
+        let egret_mat = renderer.create_material([0.92, 0.90, 0.85, 1.0]);
+
+        // Ground animal instance buffers and draw calls
+        let squirrel_count = wildlife.squirrels.len() as u32;
+        let deer_count = wildlife.deer.len() as u32;
+        let turkey_count = wildlife.turkeys.len() as u32;
+        let turtle_count = wildlife.turtles.len() as u32;
+        let egret_count = wildlife.egrets.len() as u32;
+
+        if squirrel_count > 0 {
+            let buf = renderer.create_instance_buffer(&wildlife.squirrels);
+            self.instanced_draws.push(InstancedDrawCall {
+                mesh: squirrel_mesh,
+                instance_buffer: buf,
+                instance_count: squirrel_count,
+                material_bind_group: squirrel_mat,
+            });
+        }
+        if deer_count > 0 {
+            let buf = renderer.create_instance_buffer(&wildlife.deer);
+            self.instanced_draws.push(InstancedDrawCall {
+                mesh: deer_mesh,
+                instance_buffer: buf,
+                instance_count: deer_count,
+                material_bind_group: deer_mat,
+            });
+        }
+        if turkey_count > 0 {
+            let buf = renderer.create_instance_buffer(&wildlife.turkeys);
+            self.instanced_draws.push(InstancedDrawCall {
+                mesh: turkey_mesh,
+                instance_buffer: buf,
+                instance_count: turkey_count,
+                material_bind_group: turkey_mat,
+            });
+        }
+        if turtle_count > 0 {
+            let buf = renderer.create_instance_buffer(&wildlife.turtles);
+            self.instanced_draws.push(InstancedDrawCall {
+                mesh: turtle_mesh,
+                instance_buffer: buf,
+                instance_count: turtle_count,
+                material_bind_group: turtle_mat,
+            });
+        }
+        if egret_count > 0 {
+            let buf = renderer.create_instance_buffer(&wildlife.egrets);
+            self.instanced_draws.push(InstancedDrawCall {
+                mesh: egret_mesh,
+                instance_buffer: buf,
+                instance_count: egret_count,
+                material_bind_group: egret_mat,
+            });
+        }
+
+        log::info!(
+            "Ground animals: {} squirrels, {} deer, {} turkeys, {} turtles, {} egrets",
+            squirrel_count, deer_count, turkey_count, turtle_count, egret_count
+        );
+
+        // Flying animal meshes (parameterized birds)
+        let crow_cpu = generate_bird(0.06, 0.25, 0.08);
+        let hawk_cpu = generate_bird(0.10, 0.50, 0.12);
+        let starling_cpu = generate_small_bird();
+        let goose_cpu = generate_goose();
+
+        let crow_gpu = GpuMesh::from_cpu(&renderer.device, &crow_cpu);
+        let hawk_gpu = GpuMesh::from_cpu(&renderer.device, &hawk_cpu);
+        let starling_gpu = GpuMesh::from_cpu(&renderer.device, &starling_cpu);
+        let goose_gpu = GpuMesh::from_cpu(&renderer.device, &goose_cpu);
+
+        // Flying animal materials
+        let crow_mat = renderer.create_material([0.08, 0.08, 0.10, 1.0]);
+        let hawk_mat = renderer.create_material([0.35, 0.25, 0.15, 1.0]);
+        let starling_mat = renderer.create_material([0.12, 0.12, 0.15, 1.0]);
+        let goose_mat = renderer.create_material([0.40, 0.38, 0.32, 1.0]);
+
+        // Build animated draw calls + CPU copies for each flying group
+        let flying_groups: Vec<(Vec<AnimatedInstanceData>, GpuMesh, wgpu::BindGroup)> = vec![
+            (wildlife.crows, crow_gpu, crow_mat),
+            (wildlife.hawks, hawk_gpu, hawk_mat),
+            (wildlife.starlings, starling_gpu, starling_mat),
+            (wildlife.geese, goose_gpu, goose_mat),
+        ];
+
+        self.animated_draws.clear();
+        self.flying_cpu.clear();
+
+        let mut total_flying = 0u32;
+        for (cpu_data, mesh, mat) in flying_groups {
+            let count = cpu_data.len() as u32;
+            total_flying += count;
+            let buf = renderer.create_animated_instance_buffer(&cpu_data);
+            self.animated_draws.push(AnimatedDrawCall {
+                mesh,
+                instance_buffer: buf,
+                instance_count: count,
+                material_bind_group: mat,
+            });
+            self.flying_cpu.push(cpu_data);
+        }
+
+        log::info!(
+            "Flying animals: {} crows, {} hawks, {} starlings, {} geese = {} total",
+            self.flying_cpu[0].len(),
+            self.flying_cpu[1].len(),
+            self.flying_cpu[2].len(),
+            self.flying_cpu[3].len(),
+            total_flying,
+        );
+
+        // --- Cabins + Snow banks ---
+        self.emissive_instanced_draws.clear();
+        if style.cabin_spacing_m > 0.0 {
+            let cabin_body_mesh = structures::generate_cabin_body();
+            let cabin_window_mesh = structures::generate_cabin_windows();
+            let cabin_instances = structures::place_cabins(
+                window_points,
+                style.vegetation.treeline,
+                style.cabin_spacing_m,
+            );
+            if !cabin_instances.is_empty() {
+                let body_gpu = GpuMesh::from_cpu(&renderer.device, &cabin_body_mesh);
+                let window_gpu = GpuMesh::from_cpu(&renderer.device, &cabin_window_mesh);
+                let body_mat = renderer.create_material([0.42, 0.26, 0.15, 1.0]);
+                let window_mat = renderer.create_material([2.0, 1.44, 0.60, 1.0]);
+                let body_buf = renderer.create_instance_buffer(&cabin_instances);
+                let window_buf = renderer.create_instance_buffer(&cabin_instances);
+                let count = cabin_instances.len() as u32;
+
+                self.instanced_draws.push(InstancedDrawCall {
+                    mesh: body_gpu,
+                    instance_buffer: body_buf,
+                    instance_count: count,
+                    material_bind_group: body_mat,
+                });
+                self.emissive_instanced_draws.push(InstancedDrawCall {
+                    mesh: window_gpu,
+                    instance_buffer: window_buf,
+                    instance_count: count,
+                    material_bind_group: window_mat,
+                });
+                log::info!("Cabins: {} placed", count);
+            }
+        }
+
+        // Snow banks (high_alpine_winter only — check if elevation_zones[0] suggests snow)
+        if style.elevation_zones[0] < 90000.0 {
+            let snow_start = style.elevation_zones[0];
+            let snow_instances = structures::place_snow_banks(
+                window_points,
+                RoadConfig::default().half_width,
+                snow_start,
+            );
+            if !snow_instances.is_empty() {
+                let snow_mesh = structures::generate_snow_bank();
+                let snow_gpu = GpuMesh::from_cpu(&renderer.device, &snow_mesh);
+                let snow_mat = renderer.create_material([0.88, 0.90, 0.95, 1.0]);
+                let snow_buf = renderer.create_instance_buffer(&snow_instances);
+                let count = snow_instances.len() as u32;
+
+                self.instanced_draws.push(InstancedDrawCall {
+                    mesh: snow_gpu,
+                    instance_buffer: snow_buf,
+                    instance_count: count,
+                    material_bind_group: snow_mat,
+                });
+                log::info!("Snow banks: {} placed", count);
+            }
+        }
+
+        if self.uses_windowing {
+            log::info!(
+                "Terrain window: {}..{} ({} points)",
+                self.window_start, self.window_end, window_points.len(),
+            );
+        }
+    }
+
+    fn needs_window_shift(&mut self, rider_distance: f64) -> bool {
+        let n = self.route_points.len();
+        let rider_idx = self.route_points
+            .partition_point(|p| p.distance_m < rider_distance)
+            .min(n.saturating_sub(1));
+
+        let near_end = rider_idx + REBUILD_MARGIN >= self.window_end && self.window_end < n;
+        let near_start = self.window_start > 0 && rider_idx < self.window_start + REBUILD_MARGIN;
+
+        if !near_end && !near_start { return false; }
+
+        // Re-center window on rider
+        let half = WINDOW_SIZE / 2;
+        let new_start = rider_idx.saturating_sub(half);
+        let new_end = (new_start + WINDOW_SIZE).min(n);
+        let new_start = if new_end == n { n.saturating_sub(WINDOW_SIZE) } else { new_start };
+        let new_end = if new_start == 0 { WINDOW_SIZE.min(n) } else { new_end };
+
+        if new_start == self.window_start && new_end == self.window_end { return false; }
+
+        self.window_start = new_start;
+        self.window_end = new_end;
+        true
     }
 
     fn route_name(&self) -> &'static str {
@@ -966,6 +1038,11 @@ impl App {
                     _ => {}
                 }
             }
+        }
+
+        // Check if terrain window needs shifting (long routes only)
+        if self.uses_windowing && self.needs_window_shift(self.physics_state.distance as f64) {
+            self.rebuild_terrain_window();
         }
 
         // Resolve rider position (direction-aware, with lateral offset)
