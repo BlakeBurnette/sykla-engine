@@ -8,7 +8,8 @@ pub struct PostProcessUniforms {
     pub vignette_intensity: f32,
     pub saturation: f32,
     pub color_temperature: f32,
-    pub _pad: [f32; 3],
+    pub ssao_intensity: f32,
+    pub _pad: [f32; 2],
 }
 
 impl Default for PostProcessUniforms {
@@ -19,7 +20,8 @@ impl Default for PostProcessUniforms {
             vignette_intensity: 0.15,
             saturation: 1.05,
             color_temperature: 6500.0,
-            _pad: [0.0; 3],
+            ssao_intensity: 0.5,
+            _pad: [0.0; 2],
         }
     }
 }

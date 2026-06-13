@@ -82,6 +82,7 @@ struct App {
     skeleton_system: SkeletonSystem,
     start_time: Instant,
     prev_t: f32,
+    frame_count: u64,
     route_length: f32,
     route_points: Vec<RoutePoint>,
     geo_origin: Option<GeoOrigin>,
@@ -131,6 +132,7 @@ impl App {
             skeleton_system: SkeletonSystem::new(32),
             start_time: Instant::now(),
             prev_t: 0.0,
+            frame_count: 0,
             route_length: 0.0,
             route_points: Vec::new(),
             geo_origin: None,
@@ -1009,6 +1011,12 @@ impl App {
         let t = self.start_time.elapsed().as_secs_f32();
         let dt = (t - self.prev_t).min(0.1);
         self.prev_t = t;
+        self.frame_count += 1;
+        if self.frame_count % 120 == 0 {
+            eprintln!("[NEW] frame {}: dt={:.1}ms fps={:.0}", self.frame_count, dt * 1000.0, 1.0 / dt.max(0.001));
+        }
+
+        self.frame_count += 1;
 
         // Physics-based speed
         update_physics(

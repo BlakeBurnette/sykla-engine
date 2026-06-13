@@ -5,7 +5,9 @@
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     eye_pos: vec4<f32>,
-    light_vp: mat4x4<f32>,
+    light_vp: array<mat4x4<f32>, 4>,
+    cascade_splits: vec4<f32>,
+    view: mat4x4<f32>,
 };
 
 struct LightUniform {
@@ -21,6 +23,7 @@ struct MaterialUniform {
     high_color: vec4<f32>,
     zone_params: vec4<f32>,
     terrain_params: vec4<f32>,
+    pbr_params: vec4<f32>, // [roughness, metallic, reflectance, ao]
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -28,8 +31,14 @@ struct MaterialUniform {
 @group(1) @binding(0) var<uniform> material: MaterialUniform;
 @group(1) @binding(1) var base_tex: texture_2d<f32>;
 @group(1) @binding(2) var base_samp: sampler;
-@group(2) @binding(0) var shadow_tex: texture_depth_2d;
+@group(2) @binding(0) var shadow_tex: texture_depth_2d_array;
 @group(2) @binding(1) var shadow_samp: sampler_comparison;
+
+// Terrain texture arrays (used by fs_terrain via terrain_material_bgl)
+@group(1) @binding(5) var terrain_diffuse: texture_2d_array<f32>;
+@group(1) @binding(6) var terrain_diffuse_samp: sampler;
+@group(1) @binding(7) var terrain_normals: texture_2d_array<f32>;
+@group(1) @binding(8) var terrain_normal_samp: sampler;
 
 // --- Vertex types ---
 
@@ -61,8 +70,8 @@ struct VertexOutput {
 
 // --- Helpers ---
 
-fn world_to_shadow(world_pos: vec3<f32>) -> vec3<f32> {
-    let lp = camera.light_vp * vec4<f32>(world_pos, 1.0);
+fn world_to_shadow(world_pos: vec3<f32>, cascade: u32) -> vec3<f32> {
+    let lp = camera.light_vp[cascade] * vec4<f32>(world_pos, 1.0);
     let ndc = lp.xyz / lp.w;
     return vec3<f32>(
         ndc.x * 0.5 + 0.5,
@@ -80,7 +89,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.world_pos = in.position;
     out.world_normal = in.normal;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(in.position);
+    out.shadow_pos = world_to_shadow(in.position, 0u);
     return out;
 }
 
@@ -92,7 +101,7 @@ fn vs_instanced(in: VertexInput, inst: InstanceInput) -> VertexOutput {
     out.world_pos = wp;
     out.world_normal = in.normal;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     return out;
 }
 
@@ -100,13 +109,13 @@ fn vs_instanced(in: VertexInput, inst: InstanceInput) -> VertexOutput {
 
 @vertex
 fn vs_shadow(in: VertexInput) -> @builtin(position) vec4<f32> {
-    return camera.light_vp * vec4<f32>(in.position, 1.0);
+    return camera.light_vp[0] * vec4<f32>(in.position, 1.0);
 }
 
 @vertex
 fn vs_shadow_inst(in: VertexInput, inst: InstanceInput) -> @builtin(position) vec4<f32> {
     let wp = in.position * inst.inst_scale + inst.inst_pos;
-    return camera.light_vp * vec4<f32>(wp, 1.0);
+    return camera.light_vp[0] * vec4<f32>(wp, 1.0);
 }
 
 // --- Procedural noise ---
@@ -437,37 +446,65 @@ fn terrain_bump_normal(N: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
     return normalize(N + grad1 + grad2 + grad3);
 }
 
-// --- Shadow sampling ---
+// --- Shadow sampling (cascaded) ---
 
-fn shadow_factor_biased(sp: vec3<f32>, normal: vec3<f32>) -> f32 {
-    // Bounds check — computed uniformly, applied after sampling to avoid
-    // non-uniform control flow (required by WebGPU for textureSampleCompare)
+fn shadow_factor_biased(shadow_pos_unused: vec3<f32>, normal: vec3<f32>) -> f32 {
+    // This function is called from fragment shaders that still pass shadow_pos.
+    // We ignore it and compute per-cascade from world_pos instead.
+    // To get world_pos, we rely on the calling code.
+    // For backwards compat, fall back to cascade 0 using the passed shadow_pos.
+    return shadow_cascade_sample(shadow_pos_unused, normal, 0u);
+}
+
+fn shadow_factor_cascaded(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
+    // Determine view-space depth for cascade selection
+    let view_pos = camera.view * vec4<f32>(world_pos, 1.0);
+    let depth = -view_pos.z;
+
+    // Select cascade (uniform control flow for WebGPU)
+    var cascade = 3u;
+    if (depth < camera.cascade_splits.x) {
+        cascade = 0u;
+    } else if (depth < camera.cascade_splits.y) {
+        cascade = 1u;
+    } else if (depth < camera.cascade_splits.z) {
+        cascade = 2u;
+    }
+
+    // Project into selected cascade's light space
+    let sp = world_to_shadow(world_pos, cascade);
+
+    return shadow_cascade_sample(sp, normal, cascade);
+}
+
+fn shadow_cascade_sample(sp: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
     let in_bounds = sp.x >= 0.001 && sp.x <= 0.999
                  && sp.y >= 0.001 && sp.y <= 0.999
                  && sp.z <= 1.0;
 
-    // Clamp UVs so out-of-bounds fragments still sample safely
     let uv = clamp(sp.xy, vec2<f32>(0.001), vec2<f32>(0.999));
 
-    // Slope-scaled bias — wider range to avoid shadow acne on biome-textured terrain
     let L = normalize(-light.direction.xyz);
     let NdotL = max(dot(normal, L), 0.0);
     let bias = mix(0.003, 0.001, NdotL);
 
-    // 5x5 PCF for softer shadows
-    var shadow = 0.0;
-    let texel = 1.0 / 4096.0;
+    let texel = 1.0 / 2048.0;
     let depth = sp.z - bias;
 
-    for (var x = -2i; x <= 2i; x++) {
-        for (var y = -2i; y <= 2i; y++) {
+    // Adaptive PCF: 5x5 for near cascades, 3x3 for far
+    var shadow = 0.0;
+    var samples = 0.0;
+    let pcf_range = select(1i, 2i, cascade <= 1u);
+
+    for (var x = -pcf_range; x <= pcf_range; x++) {
+        for (var y = -pcf_range; y <= pcf_range; y++) {
             let off = vec2<f32>(f32(x), f32(y)) * texel;
-            shadow += textureSampleCompare(shadow_tex, shadow_samp, uv + off, depth);
+            shadow += textureSampleCompareLevel(shadow_tex, shadow_samp, uv + off, i32(cascade), depth);
+            samples += 1.0;
         }
     }
 
-    // Out-of-bounds = fully lit (no shadow)
-    return select(shadow / 25.0, 1.0, !in_bounds);
+    return select(shadow / samples, 1.0, !in_bounds);
 }
 
 // --- Atmospheric perspective ---
@@ -548,12 +585,12 @@ fn volumetric_light(world_pos: vec3<f32>) -> vec3<f32> {
     var pos = world_pos;
     for (var i = 0u; i < 12u; i++) {
         pos += step_vec;
-        let sp = world_to_shadow(pos);
+        let sp = world_to_shadow(pos, 0u);
         let in_bounds = sp.x >= 0.001 && sp.x <= 0.999
                      && sp.y >= 0.001 && sp.y <= 0.999
                      && sp.z <= 1.0;
         let uv = clamp(sp.xy, vec2<f32>(0.001), vec2<f32>(0.999));
-        let lit = textureSampleCompare(shadow_tex, shadow_samp, uv, sp.z - 0.002);
+        let lit = textureSampleCompareLevel(shadow_tex, shadow_samp, uv, 0i, sp.z - 0.002);
         accum += select(lit, 1.0, !in_bounds);
     }
     let view_dir = normalize(world_pos - camera.eye_pos.xyz);
@@ -570,7 +607,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let N = normalize(in.world_normal);
     let L = normalize(-light.direction.xyz);
     let V = normalize(camera.eye_pos.xyz - in.world_pos);
-    let H = normalize(L + V);
 
     // Elevation zone blending — smoothstep between base/mid/high colors
     let t_low = smoothstep(material.zone_params.x, material.zone_params.y, in.world_pos.y);
@@ -639,32 +675,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Terrain bump normal — multi-scale perturbation for visible surface texture
     let N_bumped = terrain_bump_normal(N, in.world_pos);
 
-    // Lighting (use bumped normal for all terrain lighting)
-    let NdotL = dot(N_bumped, L);
-    let diff = max(NdotL, 0.0);
-    let wrap_diff = max(NdotL * 0.5 + 0.5, 0.0);
-    let spec = pow(max(dot(N_bumped, H), 0.0), 64.0);
-
-    // Subsurface-like translucency for foliage — warm glow when backlit
-    // Reduce above treeline (high zones are rock/snow, not foliage)
-    let back_light = max(dot(-N_bumped, L), 0.0);
-    let sss_color = vec3<f32>(0.45, 0.55, 0.1); // warm yellow-green glow
-    let sss_strength = 0.35 * (1.0 - t_high);
-    let sss = back_light * back_light * sss_strength * sss_color * base_color;
+    // PBR parameters
+    let roughness = material.pbr_params.x;
+    let metallic = material.pbr_params.y;
+    let ao = material.pbr_params.w;
 
     // Shadow
-    let shadow = shadow_factor_biased(in.shadow_pos, normalize(in.world_normal));
+    let shadow = shadow_factor_cascaded(in.world_pos, normalize(in.world_normal));
+
+    // PBR direct lighting
+    let sun_color = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85); // warm sun
+    let direct = pbr_direct(N_bumped, V, L, base_color, roughness, metallic, sun_color, shadow);
+
+    // PBR ambient
+    let snow_ambient_tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.75, 0.82, 1.0), t_high);
+    let ambient = pbr_ambient(N_bumped, V, base_color, roughness, metallic, light.ambient.xyz * snow_ambient_tint, ao);
+
+    // Subsurface-like translucency for foliage — warm glow when backlit
+    let back_light = max(dot(-N_bumped, L), 0.0);
+    let sss_color = vec3<f32>(0.45, 0.55, 0.1);
+    let sss_strength = 0.35 * (1.0 - t_high);
+    let sss = back_light * back_light * sss_strength * sss_color * base_color;
 
     // Warm fill light from ground bounce
     let ground_bounce = max(N_bumped.y, 0.0) * 0.08;
     let bounce_color = vec3<f32>(0.3, 0.35, 0.1) * base_color * ground_bounce;
 
-    // Combine — warm ambient with wrap lighting
-    // Blue snow shadows: tint ambient toward cool blue in high-elevation snow zones
-    let snow_ambient_tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.75, 0.82, 1.0), t_high);
-    let ambient = light.ambient.xyz * snow_ambient_tint * base_color * (0.55 + 0.45 * wrap_diff);
-    let sun_warm = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85); // extra warmth
-    let direct = shadow * (diff * sun_warm * base_color + spec * sun_warm * 0.06);
     var color = ambient + direct + sss * shadow + bounce_color;
 
     // Volumetric light shafts (god rays through tree canopy)
@@ -677,6 +713,158 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 // ── Road fragment shader — clean surface, minimal noise ─────────
+
+// ── Terrain splatmap fragment shader ─────────────────────────────
+//
+// Uses texture arrays for terrain tile textures with tri-planar mapping.
+// Biome functions produce splatmap weights; textures provide detail.
+
+fn triplanar_sample(world_pos: vec3<f32>, world_normal: vec3<f32>, layer: i32, tex_scale: f32) -> vec3<f32> {
+    let blend = abs(world_normal);
+    let b = blend / max(blend.x + blend.y + blend.z, 0.001);
+
+    let uv_xz = world_pos.xz * tex_scale;
+    let uv_xy = world_pos.xy * tex_scale;
+    let uv_yz = world_pos.yz * tex_scale;
+
+    let s_xz = textureSample(terrain_diffuse, terrain_diffuse_samp, uv_xz, layer).xyz;
+    let s_xy = textureSample(terrain_diffuse, terrain_diffuse_samp, uv_xy, layer).xyz;
+    let s_yz = textureSample(terrain_diffuse, terrain_diffuse_samp, uv_yz, layer).xyz;
+
+    return s_xz * b.y + s_xy * b.z + s_yz * b.x;
+}
+
+fn triplanar_normal_sample(world_pos: vec3<f32>, world_normal: vec3<f32>, layer: i32, tex_scale: f32) -> vec3<f32> {
+    let blend = abs(world_normal);
+    let b = blend / max(blend.x + blend.y + blend.z, 0.001);
+
+    let uv_xz = world_pos.xz * tex_scale;
+    let uv_xy = world_pos.xy * tex_scale;
+    let uv_yz = world_pos.yz * tex_scale;
+
+    let n_xz = textureSample(terrain_normals, terrain_normal_samp, uv_xz, layer).xyz * 2.0 - 1.0;
+    let n_xy = textureSample(terrain_normals, terrain_normal_samp, uv_xy, layer).xyz * 2.0 - 1.0;
+    let n_yz = textureSample(terrain_normals, terrain_normal_samp, uv_yz, layer).xyz * 2.0 - 1.0;
+
+    return normalize(n_xz * b.y + n_xy * b.z + n_yz * b.x);
+}
+
+/// Compute biome splatmap weights: [grass, dirt, rock, snow/sand]
+fn compute_biome_weights(
+    world_pos: vec3<f32>, dist_from_center: f32, slope: f32,
+    biome_type: f32, elev: f32, zone_params: vec4<f32>,
+) -> vec4<f32> {
+    var w = vec4<f32>(1.0, 0.0, 0.0, 0.0); // default: all grass
+
+    if (biome_type < 1.5) {
+        // Piedmont: grass + dirt on slopes + dirt on path
+        let path_wear = smoothstep(0.15, 0.0, dist_from_center);
+        let slope_dirt = clamp(slope * 2.5, 0.0, 0.5);
+        w = vec4<f32>(1.0 - slope_dirt - path_wear * 0.6, slope_dirt + path_wear * 0.6, 0.0, 0.0);
+    } else if (biome_type < 2.5) {
+        // Alpine: grass → rock → snow by elevation
+        let t_rock = smoothstep(zone_params.x, zone_params.y, elev);
+        let t_snow = smoothstep(zone_params.z, zone_params.w, elev);
+        let snow_coverage = t_snow * smoothstep(0.2, 0.6, 1.0 - slope);
+        w = vec4<f32>(
+            max(1.0 - t_rock - snow_coverage, 0.0),
+            0.0,
+            t_rock * (1.0 - snow_coverage),
+            snow_coverage,
+        );
+    } else if (biome_type < 3.5) {
+        // Desert: sand dominant + rock on slopes
+        let rock_w = clamp(slope * 2.0, 0.0, 0.7);
+        w = vec4<f32>(0.0, 0.0, rock_w, 1.0 - rock_w); // sand in w channel
+    } else if (biome_type < 4.5) {
+        // Coastal: grass + sand mix
+        let sand_w = smoothstep(0.3, 0.7, dist_from_center);
+        w = vec4<f32>(1.0 - sand_w, 0.0, 0.0, sand_w);
+    } else {
+        // Forest: grass + dirt
+        let canopy = smoothstep(0.05, 0.15, dist_from_center) * (1.0 - smoothstep(0.7, 1.0, dist_from_center));
+        let dirt_w = canopy * 0.5 + clamp(slope * 2.0, 0.0, 0.4);
+        w = vec4<f32>(1.0 - dirt_w, dirt_w, 0.0, 0.0);
+    }
+
+    // Normalize weights
+    let total = max(w.x + w.y + w.z + w.w, 0.001);
+    return w / total;
+}
+
+@fragment
+fn fs_terrain(in: VertexOutput) -> @location(0) vec4<f32> {
+    let N = normalize(in.world_normal);
+    let L = normalize(-light.direction.xyz);
+    let V = normalize(camera.eye_pos.xyz - in.world_pos);
+
+    let slope = 1.0 - max(N.y, 0.0);
+    let dist_from_center = abs(in.uv.x - 0.5) * 2.0;
+    let biome_type = material.terrain_params.w;
+
+    // Compute splatmap weights from biome
+    let weights = compute_biome_weights(
+        in.world_pos, dist_from_center, slope,
+        biome_type, in.world_pos.y, material.zone_params,
+    );
+
+    // Tri-planar texture sampling per layer, weighted blend
+    let tex_scale = 0.25; // 1 tile per 4 world units
+    var albedo = vec3<f32>(0.0);
+    albedo += weights.x * triplanar_sample(in.world_pos, N, 0, tex_scale); // grass
+    albedo += weights.y * triplanar_sample(in.world_pos, N, 1, tex_scale); // dirt
+    albedo += weights.z * triplanar_sample(in.world_pos, N, 2, tex_scale); // rock
+    albedo += weights.w * triplanar_sample(in.world_pos, N, 3, tex_scale); // snow/sand
+
+    // Procedural variation from existing FBM (keeps biome richness)
+    let grain = fbm_n(in.world_pos.xz * 0.06, 3);
+    albedo *= 0.8 + grain * 0.4;
+
+    // Tri-planar normal map blend
+    var tn = vec3<f32>(0.0, 0.0, 1.0);
+    tn += weights.x * triplanar_normal_sample(in.world_pos, N, 0, tex_scale);
+    tn += weights.y * triplanar_normal_sample(in.world_pos, N, 1, tex_scale);
+    tn += weights.z * triplanar_normal_sample(in.world_pos, N, 2, tex_scale);
+    tn += weights.w * triplanar_normal_sample(in.world_pos, N, 3, tex_scale);
+    // Perturb geometric normal with tangent-space normal
+    let N_textured = normalize(N + vec3<f32>(tn.x, 0.0, tn.y) * 0.3);
+
+    // Snow-on-normals
+    if (material.mid_color.w > 1.5) {
+        let snow_color = vec3<f32>(0.94, 0.94, 0.91);
+        let snow_t = smoothstep(0.25, 0.65, N.y);
+        albedo = mix(albedo, snow_color, snow_t);
+    }
+
+    // PBR lighting
+    let roughness = material.pbr_params.x;
+    let metallic = material.pbr_params.y;
+    let ao = material.pbr_params.w;
+
+    let shadow = shadow_factor_cascaded(in.world_pos, normalize(in.world_normal));
+
+    let sun_color = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85);
+    let direct = pbr_direct(N_textured, V, L, albedo, roughness, metallic, sun_color, shadow);
+
+    let t_high = smoothstep(material.zone_params.z, material.zone_params.w, in.world_pos.y);
+    let snow_ambient_tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.75, 0.82, 1.0), t_high);
+    let ambient = pbr_ambient(N_textured, V, albedo, roughness, metallic, light.ambient.xyz * snow_ambient_tint, ao);
+
+    // Subsurface foliage glow
+    let back_light = max(dot(-N_textured, L), 0.0);
+    let sss_color = vec3<f32>(0.45, 0.55, 0.1);
+    let sss_strength = 0.35 * (1.0 - t_high);
+    let sss = back_light * back_light * sss_strength * sss_color * albedo;
+
+    let ground_bounce = max(N_textured.y, 0.0) * 0.08;
+    let bounce_color = vec3<f32>(0.3, 0.35, 0.1) * albedo * ground_bounce;
+
+    var color = ambient + direct + sss * shadow + bounce_color;
+    color += volumetric_light(in.world_pos);
+    color = apply_atmosphere(color, in.world_pos);
+
+    return vec4<f32>(color, 1.0);
+}
 
 @fragment
 fn fs_road(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -972,19 +1160,18 @@ fn fs_road(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Lighting — use perturbed normal for both paved and gravel
+    // PBR lighting — use perturbed normal
     let shade_N = N_perturbed;
-    let shade_H = normalize(L + V);
-    let NdotL = dot(shade_N, L);
-    let diff = max(NdotL, 0.0);
-    let spec = pow(max(dot(shade_N, shade_H), 0.0), surface_spec);
+    let road_roughness = material.pbr_params.x;
+    let road_metallic = material.pbr_params.y;
+    let road_ao = material.pbr_params.w;
 
     // Shadow
-    let shadow = shadow_factor_biased(in.shadow_pos, normalize(in.world_normal));
+    let shadow = shadow_factor_cascaded(in.world_pos, normalize(in.world_normal));
 
-    let ambient = light.ambient.xyz * base_color * 0.6;
     let sun = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85);
-    let direct = shadow * (diff * sun * base_color + spec * sun * spec_strength);
+    let direct = pbr_direct(shade_N, V, L, base_color, road_roughness, road_metallic, sun, shadow);
+    let ambient = pbr_ambient(shade_N, V, base_color, road_roughness, road_metallic, light.ambient.xyz, road_ao);
     var color = ambient + direct;
 
     // Exponential atmospheric fog
@@ -1040,7 +1227,7 @@ fn vs_grass_shell(
     out.world_pos = pos;
     out.world_normal = in.normal;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(pos);
+    out.shadow_pos = world_to_shadow(pos, 0u);
     out.shell_t = t;
     return out;
 }
@@ -1099,7 +1286,7 @@ fn fs_grass_shell(in: GrassVertexOutput) -> @location(0) vec4<f32> {
     let NdotL = dot(N, L);
     let diff = max(NdotL, 0.0);
     let wrap_diff = max(NdotL * 0.5 + 0.5, 0.0);
-    let shadow = shadow_factor_biased(in.shadow_pos, N);
+    let shadow = shadow_factor_cascaded(in.world_pos, N);
 
     let ambient = light.ambient.xyz * grass_color * (0.55 + 0.45 * wrap_diff);
     let sun = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85);
@@ -1211,7 +1398,7 @@ fn vs_grass_blade(in: VertexInput, blade: GrassBladeInput) -> GrassBladeOutput {
     out.world_pos = wp;
     out.world_normal = blade_normal;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     out.blade_t = t;
     out.color_var = blade.blade_color_var;
     return out;
@@ -1273,7 +1460,7 @@ fn fs_grass_blade(in: GrassBladeOutput) -> @location(0) vec4<f32> {
     let sss_color = vec3<f32>(0.45, 0.55, 0.15);
 
     // Shadow
-    let shadow = shadow_factor_biased(in.shadow_pos, N);
+    let shadow = shadow_factor_cascaded(in.world_pos, N);
 
     // Combine lighting
     let ambient = light.ambient.xyz * blade_color * (0.5 + 0.5 * wrap);
@@ -1310,7 +1497,7 @@ fn vs_animated(in: VertexInput, inst: AnimInstanceInput) -> VertexOutput {
     out.world_pos = wp;
     out.world_normal = in.normal;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     return out;
 }
 
@@ -1322,7 +1509,7 @@ fn vs_shadow_animated(in: VertexInput, inst: AnimInstanceInput) -> @builtin(posi
     local.y += sin(time * 6.0 + inst.anim_phase) * 0.15 * abs(in.position.x) * inst.anim_scale;
 
     let wp = local * inst.anim_scale + inst.anim_pos;
-    return camera.light_vp * vec4<f32>(wp, 1.0);
+    return camera.light_vp[0] * vec4<f32>(wp, 1.0);
 }
 
 // ── Cyclist bone matrix skinning ─────────────────────────────────
@@ -1388,7 +1575,7 @@ fn vs_cyclist(
     out.world_pos = wp;
     out.world_normal = vec3<f32>(rnx, rny, rnz);
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     out.bind_pos = in.position;
     return out;
 }
@@ -1420,7 +1607,7 @@ fn vs_shadow_cyclist(
     let rz = -lx * sin_a + lz * cos_a;
 
     let wp = vec3<f32>(rx, ry, rz) * inst.scale + inst.pos;
-    return camera.light_vp * vec4<f32>(wp, 1.0);
+    return camera.light_vp[0] * vec4<f32>(wp, 1.0);
 }
 
 // ── Cyclist fragment shader (procedural surface detail per material type) ────
@@ -1556,38 +1743,33 @@ fn fs_cyclist(in: CyclistSolidOutput) -> @location(0) vec4<f32> {
     let fine_noise = noise2d(in.bind_pos.xz * 80.0);
     base *= 0.96 + fine_noise * 0.08;
 
-    // Lighting
-    let NdotL = max(dot(N, L), 0.0);
-    let shadow = shadow_factor_biased(in.shadow_pos, N_raw);
-    let diffuse = NdotL * shadow;
+    // PBR lighting with per-part roughness/metallic
+    let shadow = shadow_factor_cascaded(in.world_pos, N_raw);
 
-    // Material-adaptive specular
-    var shininess: f32;
-    var spec_strength: f32;
+    var part_roughness: f32;
+    var part_metallic: f32;
     if (is_bike) {
-        shininess = 96.0;
-        spec_strength = 0.55;
+        part_roughness = 0.2;
+        part_metallic = 0.8;
     } else if (luminance > 0.7) {
-        // Helmet — high gloss
-        shininess = 128.0;
-        spec_strength = 0.65;
+        // Helmet — glossy plastic
+        part_roughness = 0.15;
+        part_metallic = 0.0;
     } else {
-        // Fabric — matte with subtle lycra sheen
-        shininess = 24.0;
-        spec_strength = 0.12;
-        // Anisotropic-like sheen for lycra stretch direction
-        let stretch = normalize(vec3<f32>(0.0, 1.0, 0.0));
-        let aniso = pow(max(1.0 - abs(dot(H, stretch)), 0.0), 3.0);
-        spec_strength += aniso * 0.25 * detail_fade;
+        // Fabric — matte lycra
+        part_roughness = 0.7;
+        part_metallic = 0.0;
     }
-    let spec = pow(max(dot(N, H), 0.0), shininess) * shadow * spec_strength;
+
+    let sun = light.color.xyz;
+    let direct = pbr_direct(N, V, L, base, part_roughness, part_metallic, sun, shadow);
+    let ambient = pbr_ambient(N, V, base, part_roughness, part_metallic, light.ambient.xyz, 1.0);
 
     // Rim light — subtle silhouette glow
     let rim = pow(1.0 - max(dot(V, N_raw), 0.0), 3.0) * 0.08;
     let rim_color = light.color.xyz * base * rim;
 
-    var color = base * (light.ambient.xyz + light.color.xyz * diffuse)
-              + light.color.xyz * spec + rim_color;
+    var color = ambient + direct + rim_color;
     color = apply_atmosphere(color, in.world_pos);
 
     return vec4<f32>(color, 1.0);
@@ -1654,7 +1836,7 @@ fn vs_skin_cyclist(
     out.world_pos = wp;
     out.world_normal = vec3<f32>(rnx, rny, rnz);
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     out.bind_pos = in.position; // pre-skinned position for body region
 
     return out;
@@ -1689,6 +1871,58 @@ fn smith_g(NdotV: f32, NdotL: f32, alpha: f32) -> f32 {
     let gv = NdotV + sqrt(a2 + (1.0 - a2) * NdotV * NdotV);
     let gl = NdotL + sqrt(a2 + (1.0 - a2) * NdotL * NdotL);
     return 1.0 / (gv * gl);
+}
+
+// ============================================================
+// PBR Cook-Torrance functions
+// ============================================================
+
+fn schlick_f(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+fn pbr_direct(
+    N: vec3<f32>, V: vec3<f32>, L: vec3<f32>,
+    albedo: vec3<f32>, roughness: f32, metallic: f32,
+    light_color: vec3<f32>, shadow: f32,
+) -> vec3<f32> {
+    let H = normalize(V + L);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 0.001);
+    let NdotH = max(dot(N, H), 0.0);
+    let VdotH = max(dot(V, H), 0.0);
+
+    let alpha = max(roughness * roughness, 0.002);
+    let f0 = mix(vec3<f32>(0.04, 0.04, 0.04), albedo, metallic);
+
+    let D = ggx_d(NdotH, alpha);
+    let G = smith_g(NdotV, NdotL, alpha);
+    let F = schlick_f(VdotH, f0);
+
+    let spec = D * G * F; // smith_g already includes 1/(4*NdotV*NdotL) denominator
+    let kd = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+    let diffuse = kd * albedo / 3.14159;
+
+    return (diffuse + spec) * light_color * NdotL * shadow;
+}
+
+fn pbr_ambient(
+    N: vec3<f32>, V: vec3<f32>,
+    albedo: vec3<f32>, roughness: f32, metallic: f32,
+    ambient_light: vec3<f32>, ao: f32,
+) -> vec3<f32> {
+    let NdotV = max(dot(N, V), 0.001);
+    let f0 = mix(vec3<f32>(0.04, 0.04, 0.04), albedo, metallic);
+    let F = schlick_f(NdotV, f0);
+
+    // Diffuse ambient
+    let kd = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+    let diffuse = kd * albedo * ambient_light;
+
+    // Simplified specular ambient (no env map yet — use ambient * fresnel)
+    let spec = F * ambient_light * (1.0 - roughness) * 0.3;
+
+    return (diffuse + spec) * ao;
 }
 
 /// Dual-lobe skin specular: sharp oily surface + broad rough surface
@@ -1937,7 +2171,7 @@ fn fs_skin_cyclist(in: SkinCyclistOutput) -> @location(0) vec4<f32> {
     }
 
     // ── Shadow ──
-    let shadow = shadow_factor_biased(in.shadow_pos, N_raw);
+    let shadow = shadow_factor_cascaded(in.world_pos, N_raw);
 
     // ── Combine all layers ──
     var color = ambient
@@ -2056,7 +2290,7 @@ fn vs_textured_cyclist(
     out.world_pos = wp;
     out.world_normal = vec3<f32>(rnx, rny, rnz);
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     out.bind_pos = in.position;
 
     // Procedural cylindrical UV from bind-pose (pre-skinned) position
@@ -2185,24 +2419,20 @@ fn fs_textured_cyclist(in: TexturedCyclistOutput) -> @location(0) vec4<f32> {
     let wear = fbm_n(in.tex_uv * 15.0, 2);
     base *= 0.95 + wear * 0.10;
 
-    // Lighting
-    let NdotL = max(dot(N, L), 0.0);
-    let shadow = shadow_factor_biased(in.shadow_pos, N_raw);
-    let diffuse = NdotL * shadow;
+    // PBR lighting — lycra fabric
+    let shadow = shadow_factor_cascaded(in.world_pos, N_raw);
+    let fabric_roughness = 0.65;
+    let fabric_metallic = 0.0;
 
-    // Lycra specular — base spec + anisotropic stretch sheen
-    let base_spec = pow(max(dot(N, H), 0.0), 32.0) * 0.15;
-    let stretch = normalize(vec3<f32>(0.0, 1.0, 0.0));
-    let aniso = pow(max(1.0 - abs(dot(H, stretch)), 0.0), 3.0);
-    let lycra_sheen = aniso * 0.20 * detail_fade;
-    let spec = (base_spec + lycra_sheen) * shadow;
+    let sun = light.color.xyz;
+    let direct = pbr_direct(N, V, L, base, fabric_roughness, fabric_metallic, sun, shadow);
+    let ambient = pbr_ambient(N, V, base, fabric_roughness, fabric_metallic, light.ambient.xyz, 1.0);
 
     // Rim light — silhouette definition
     let rim = pow(1.0 - max(dot(V, N_raw), 0.0), 3.0) * 0.06;
     let rim_color = light.color.xyz * base * rim;
 
-    var color = base * (light.ambient.xyz + light.color.xyz * diffuse)
-              + light.color.xyz * spec + rim_color;
+    var color = ambient + direct + rim_color;
     color = apply_atmosphere(color, in.world_pos);
 
     return vec4<f32>(color, 1.0);
@@ -2255,7 +2485,7 @@ fn vs_tree_instanced(in: VertexInput, inst: TreeInstanceInput) -> VertexOutput {
     out.world_pos = wp;
     out.world_normal = norm;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(wp);
+    out.shadow_pos = world_to_shadow(wp, 0u);
     return out;
 }
 
@@ -2283,7 +2513,7 @@ fn vs_shadow_tree_inst(in: VertexInput, inst: TreeInstanceInput) -> @builtin(pos
     }
 
     let wp = local * inst.tree_scale + inst.tree_pos;
-    return camera.light_vp * vec4<f32>(wp, 1.0);
+    return camera.light_vp[0] * vec4<f32>(wp, 1.0);
 }
 
 @fragment
@@ -2291,17 +2521,10 @@ fn fs_textured(in: VertexOutput) -> @location(0) vec4<f32> {
     let N = normalize(in.world_normal);
     let L = normalize(-light.direction.xyz);
     let V = normalize(camera.eye_pos.xyz - in.world_pos);
-    let H = normalize(L + V);
 
     // Sample texture and tint by material base_color
     let tex_color = textureSample(base_tex, base_samp, in.uv);
     let base_color = tex_color.xyz * material.base_color.xyz;
-
-    // Lighting — diffuse + specular + subsurface translucency
-    let NdotL = dot(N, L);
-    let diff = max(NdotL, 0.0);
-    let wrap_diff = max(NdotL * 0.5 + 0.5, 0.0);
-    let spec = pow(max(dot(N, H), 0.0), 64.0);
 
     // Subsurface translucency for foliage backlight
     let back_light = max(dot(-N, L), 0.0);
@@ -2317,16 +2540,20 @@ fn fs_textured(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Shadow
-    let shadow = shadow_factor_biased(in.shadow_pos, N);
+    let shadow = shadow_factor_cascaded(in.world_pos, N);
+
+    // PBR lighting
+    let tree_roughness = material.pbr_params.x;
+    let tree_metallic = material.pbr_params.y;
+    let tree_ao = material.pbr_params.w;
+    let sun_warm = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85);
+    let direct = pbr_direct(N, V, L, final_base, tree_roughness, tree_metallic, sun_warm, shadow);
+    let ambient = pbr_ambient(N, V, final_base, tree_roughness, tree_metallic, light.ambient.xyz, tree_ao);
 
     // Ground bounce
     let ground_bounce = max(N.y, 0.0) * 0.08;
     let bounce_color = vec3<f32>(0.3, 0.35, 0.1) * final_base * ground_bounce;
 
-    // Combine
-    let ambient = light.ambient.xyz * final_base * (0.55 + 0.45 * wrap_diff);
-    let sun_warm = light.color.xyz * vec3<f32>(1.0, 0.95, 0.85);
-    let direct = shadow * (diff * sun_warm * final_base + spec * sun_warm * 0.06);
     var color = ambient + direct + sss * shadow + bounce_color;
 
     // Volumetric light shafts
@@ -2363,7 +2590,7 @@ fn vs_water(in: VertexInput) -> VertexOutput {
     out.world_pos = pos;
     out.world_normal = N;
     out.uv = in.uv;
-    out.shadow_pos = world_to_shadow(pos);
+    out.shadow_pos = world_to_shadow(pos, 0u);
     return out;
 }
 
@@ -2415,19 +2642,21 @@ fn fs_water(in: VertexOutput) -> @location(0) vec4<f32> {
     let reflected_view = reflect(-V, N);
     let sky_reflect = sample_sky_color(reflected_view.y);
 
-    // Sun specular sparkle — sharp point highlights on ripple peaks
-    let reflect_dir = reflect(-L, N);
-    let spec = pow(max(dot(V, reflect_dir), 0.0), 256.0) * 2.0;
+    // GGX specular for sun sparkle on water
+    let water_roughness = 0.05; // very smooth water surface
+    let water_alpha = water_roughness * water_roughness;
+    let NdotH_w = max(dot(N, H), 0.0);
+    let spec = ggx_d(NdotH_w, water_alpha) * 0.5;
 
     // Shadow
-    let shadow = shadow_factor_biased(in.shadow_pos, N);
+    let shadow = shadow_factor_cascaded(in.world_pos, N);
 
     // Composite water surface
     let surface = mix(water_color, sky_reflect, fresnel);
 
-    // Lighting
+    // PBR-ish water lighting
     let NdotL = max(dot(N, L), 0.0);
-    let ambient = light.ambient.xyz * water_color * 0.45;
+    let ambient = pbr_ambient(N, V, water_color, 0.3, 0.0, light.ambient.xyz, 1.0);
     let direct = shadow * (NdotL * light.color.xyz * surface * 0.6 + spec * light.color.xyz * 0.9);
     var color = ambient + direct + surface * 0.3;
 
@@ -2550,9 +2779,9 @@ struct PostProcessUniforms {
     vignette_intensity: f32,
     saturation: f32,
     color_temperature: f32,
+    ssao_intensity: f32,
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> post: PostProcessUniforms;
@@ -2560,11 +2789,17 @@ struct PostProcessUniforms {
 @group(0) @binding(2) var scene_samp: sampler;
 @group(0) @binding(3) var bloom_tex: texture_2d<f32>;
 @group(0) @binding(4) var bloom_samp: sampler;
+@group(0) @binding(5) var ssao_tex: texture_2d<f32>;
+@group(0) @binding(6) var ssao_samp: sampler;
 
 @fragment
 fn fs_post_process(in: FullscreenOutput) -> @location(0) vec4<f32> {
     var color = textureSample(scene_tex, scene_samp, in.uv).xyz;
     let bloom = textureSample(bloom_tex, bloom_samp, in.uv).xyz;
+
+    // Apply SSAO
+    let ao = textureSample(ssao_tex, ssao_samp, in.uv).r;
+    color *= mix(1.0, ao, post.ssao_intensity);
 
     // Apply bloom
     color += bloom * post.bloom_intensity;
@@ -2593,6 +2828,161 @@ fn fs_post_process(in: FullscreenOutput) -> @location(0) vec4<f32> {
     color *= clamp(vignette, 0.0, 1.0);
 
     return vec4<f32>(clamp(color, vec3(0.0), vec3(1.0)), 1.0);
+}
+
+// ── SSR (screen-space reflections) ──────────────────────────────
+//
+// Reads HDR scene + depth. Ray-marches in screen space to find reflections.
+// Output: reflected color in RGB, confidence in A.
+
+@group(0) @binding(0) var ssr_scene_tex: texture_2d<f32>;
+@group(0) @binding(1) var ssr_scene_samp: sampler;
+@group(0) @binding(2) var ssr_depth_tex: texture_depth_2d;
+@group(0) @binding(3) var ssr_depth_samp: sampler;
+
+fn ssr_linearize(d: f32) -> f32 {
+    let near = 0.5;
+    let far = 5000.0;
+    return near * far / (far - d * (far - near));
+}
+
+@fragment
+fn fs_ssr(in: FullscreenOutput) -> @location(0) vec4<f32> {
+    let depth = textureSample(ssr_depth_tex, ssr_depth_samp, in.uv);
+    if (depth >= 0.999) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0); // sky, no reflection
+    }
+
+    // Reconstruct view direction and reflect
+    let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
+    let lin_depth = ssr_linearize(depth);
+
+    // Simple screen-space ray march upward (water reflects upward)
+    let step_size = 0.02; // UV space step
+    var ray_uv = in.uv;
+    var hit_color = vec4<f32>(0.0);
+
+    // March upward in screen space (water reflects sky/terrain above)
+    for (var i = 0u; i < 16u; i++) {
+        ray_uv.y -= step_size; // move up
+        if (ray_uv.y < 0.0) { break; }
+
+        let sample_depth = textureSample(ssr_depth_tex, ssr_depth_samp, ray_uv);
+        let sample_lin = ssr_linearize(sample_depth);
+
+        // If we hit geometry that's closer than our projected ray
+        if (sample_lin < lin_depth - 0.5 * f32(i + 1u)) {
+            hit_color = textureSample(ssr_scene_tex, ssr_scene_samp, ray_uv);
+            // Fade confidence with distance
+            hit_color.a = 1.0 - f32(i) / 16.0;
+            break;
+        }
+    }
+
+    return hit_color;
+}
+
+// ── SSAO passes ─────────────────────────────────────────────────
+//
+// Pass 1: SSAO sampling — reads depth buffer, outputs occlusion factor
+// Pass 2: SSAO blur — bilateral blur to smooth result
+
+struct SsaoUniforms {
+    screen_size: vec2<f32>,
+    radius: f32,
+    bias: f32,
+    inv_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> ssao_params: SsaoUniforms;
+@group(0) @binding(1) var ssao_depth_tex: texture_depth_2d;
+@group(0) @binding(2) var ssao_depth_samp: sampler;
+@group(0) @binding(3) var ssao_noise_tex: texture_2d<f32>;
+@group(0) @binding(4) var<storage, read> ssao_kernel: array<vec4<f32>>;
+
+fn linearize_depth(d: f32) -> f32 {
+    let near = 0.5;
+    let far = 5000.0;
+    return near * far / (far - d * (far - near));
+}
+
+fn reconstruct_view_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let ndc = vec4<f32>(uv * 2.0 - 1.0, depth, 1.0);
+    let view_pos = ssao_params.inv_proj * ndc;
+    return view_pos.xyz / view_pos.w;
+}
+
+@fragment
+fn fs_ssao(in: FullscreenOutput) -> @location(0) f32 {
+    let depth = textureSample(ssao_depth_tex, ssao_depth_samp, in.uv);
+    if (depth >= 1.0) {
+        return 1.0; // sky — no occlusion
+    }
+
+    let view_pos = reconstruct_view_pos(in.uv, depth);
+
+    // Reconstruct normal from depth (cross-product of view-space derivatives)
+    let texel = 1.0 / ssao_params.screen_size;
+    let d_right = textureSample(ssao_depth_tex, ssao_depth_samp, in.uv + vec2<f32>(texel.x, 0.0));
+    let d_up = textureSample(ssao_depth_tex, ssao_depth_samp, in.uv + vec2<f32>(0.0, texel.y));
+    let pos_right = reconstruct_view_pos(in.uv + vec2<f32>(texel.x, 0.0), d_right);
+    let pos_up = reconstruct_view_pos(in.uv + vec2<f32>(0.0, texel.y), d_up);
+    let N = normalize(cross(pos_right - view_pos, pos_up - view_pos));
+
+    // Random rotation from noise texture
+    let noise_uv = in.uv * ssao_params.screen_size / 4.0;
+    let noise = textureSample(ssao_noise_tex, ssao_depth_samp, noise_uv).xy * 2.0 - 1.0;
+
+    // Construct TBN from noise
+    let T = normalize(vec3<f32>(noise.x, noise.y, 0.0) - N * dot(vec3<f32>(noise.x, noise.y, 0.0), N));
+    let B = cross(N, T);
+    let TBN = mat3x3<f32>(T, B, N);
+
+    // Sample hemisphere
+    var occlusion = 0.0;
+    let num_samples = 16u; // Use first 16 of 32 kernel samples for perf
+    for (var i = 0u; i < num_samples; i++) {
+        let sample_dir = TBN * ssao_kernel[i].xyz;
+        let sample_pos = view_pos + sample_dir * ssao_params.radius;
+
+        // Project to screen
+        let proj = ssao_params.inv_proj; // Actually need projection, not inv
+        // Approximate: use simple perspective divide
+        let offset_ndc = vec4<f32>(sample_pos, 1.0);
+        // Since we don't have the projection matrix directly, approximate screen UV
+        let sample_uv = clamp(
+            in.uv + sample_dir.xy * ssao_params.radius * 0.5 / max(-view_pos.z, 0.1),
+            vec2<f32>(0.0), vec2<f32>(1.0),
+        );
+
+        let sample_depth = textureSample(ssao_depth_tex, ssao_depth_samp, sample_uv);
+        let sample_view = reconstruct_view_pos(sample_uv, sample_depth);
+
+        let range_check = smoothstep(0.0, 1.0, ssao_params.radius / max(abs(view_pos.z - sample_view.z), 0.001));
+        if (sample_view.z >= sample_pos.z + ssao_params.bias) {
+            occlusion += range_check;
+        }
+    }
+
+    return 1.0 - (occlusion / f32(num_samples));
+}
+
+// SSAO blur bindings (separate bind group)
+@group(0) @binding(0) var ssao_blur_input: texture_2d<f32>;
+@group(0) @binding(1) var ssao_blur_samp: sampler;
+
+@fragment
+fn fs_ssao_blur(in: FullscreenOutput) -> @location(0) f32 {
+    // Simple 4x4 box blur
+    var result = 0.0;
+    let texel_size = 1.0 / vec2<f32>(textureDimensions(ssao_blur_input));
+    for (var x = -2i; x <= 1i; x++) {
+        for (var y = -2i; y <= 1i; y++) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel_size;
+            result += textureSample(ssao_blur_input, ssao_blur_samp, in.uv + offset).r;
+        }
+    }
+    return result / 16.0;
 }
 
 // ── Bloom passes ────────────────────────────────────────────────
